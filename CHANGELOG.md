@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.1] - 2026-03-12
+
+### Changed
+- Claude launcher now includes `--effort max` for maximum extended thinking in autonomous sessions
+
 ## [0.6.0] - 2026-03-12
 
 ### Added
