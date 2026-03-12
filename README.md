@@ -7,9 +7,10 @@ Small Go CLI for kicking off the next ready Beads task through OpenCode or Claud
 - runs `bd ready --json` in a target repo
 - selects the next best ready issue
 - optionally claims it
-- builds an `/rp1-build "requirement" "description" --git-pr --afk` prompt
+- builds an `/rp1-build "requirement" "description" --afk` prompt
 - launches OpenCode in the target repo with `opencoder` and an Opus-class model
 - can fall back to Claude Code with `--launcher claude`
+- **loop mode**: continuously processes all ready issues, closing each on success
 
 ## Install
 
@@ -56,6 +57,30 @@ go run ./cmd/autopilot next --repo /Users/felipeh/Development/jobber --launcher 
 # Print just the generated /rp1-build prompt
 go run ./cmd/autopilot next --repo /Users/felipeh/Development/jobber --print-prompt
 ```
+
+### Loop mode
+
+Process all ready issues sequentially, closing each on success:
+
+```bash
+# Loop through all ready issues with Claude
+autopilot loop --repo /Users/felipeh/Development/jobber --launcher claude
+
+# Limit to 5 tasks with a 30s cooldown between each
+autopilot loop --repo /Users/felipeh/Development/jobber --max-tasks 5 --cooldown 30s
+
+# Use OpenCode (default launcher)
+autopilot loop --repo /Users/felipeh/Development/jobber
+```
+
+The loop:
+1. Picks the highest-priority ready issue
+2. Claims it
+3. Launches the agent
+4. On exit 0: closes the issue via `bd close`
+5. On non-zero exit: logs the failure, continues to next issue
+6. Repeats until no ready issues remain (or `--max-tasks` reached)
+7. Handles SIGINT/SIGTERM gracefully
 
 ## Defaults
 

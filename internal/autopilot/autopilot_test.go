@@ -77,7 +77,7 @@ func TestBuildRP1PromptIncludesBeadsContext(t *testing.T) {
 		"jobber-t6m-7-replace-the-web-dev-server-container-with-a-production-web",
 		"beads://jobber/jobber-t6m.7",
 		"bd show jobber-t6m.7 --json --long",
-		"--git-pr --afk",
+		"--afk",
 	}
 
 	for _, check := range checks {
@@ -311,6 +311,213 @@ func TestVersionCommandPrintsVersion(t *testing.T) {
 	if strings.TrimSpace(stdout.String()) != "0.1.0 (abc123)" {
 		t.Fatalf("unexpected version output: %q", stdout.String())
 	}
+}
+
+func TestRunLoopProcessesIssuesUntilEmpty(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+
+	readyJSONFirst := `[{"id":"job-1","title":"First task","priority":1,"issue_type":"task","created_at":"2026-03-10T10:00:00Z"}]`
+	readyJSONSecond := `[{"id":"job-2","title":"Second task","priority":2,"issue_type":"task","created_at":"2026-03-10T11:00:00Z"}]`
+	showJSON1 := `[{"id":"job-1","title":"First task","description":"Details","acceptance_criteria":"Done","priority":1,"issue_type":"task","created_at":"2026-03-10T10:00:00Z"}]`
+	showJSON2 := `[{"id":"job-2","title":"Second task","description":"Details","acceptance_criteria":"Done","priority":2,"issue_type":"task","created_at":"2026-03-10T11:00:00Z"}]`
+
+	// Track how many times bd ready is called to return different results.
+	readyCallCount := 0
+	fake := &fakeRunner{
+		runOutputs: map[string][]byte{
+			commandKey("bd", "show", "job-1", "--json", "--long"):    []byte(showJSON1),
+			commandKey("bd", "show", "job-2", "--json", "--long"):    []byte(showJSON2),
+			commandKey("bd", "update", "job-1", "--claim", "--json"): []byte(`{"id":"job-1"}`),
+			commandKey("bd", "update", "job-2", "--claim", "--json"): []byte(`{"id":"job-2"}`),
+		},
+		lookups: map[string]error{},
+	}
+
+	// Override Run to cycle through ready results.
+	origRun := fake.Run
+	_ = origRun
+	readyKey := commandKey("bd", "ready", "--json")
+	fake.runOutputs[readyKey] = []byte(readyJSONFirst)
+
+	// We need a custom runner to cycle through ready outputs and match close commands.
+	cycleRunner := &cycleReadyRunner{
+		fakeRunner: fake,
+		readyOutputs: [][]byte{
+			[]byte(readyJSONFirst),
+			[]byte(readyJSONSecond),
+			[]byte(`[]`),
+		},
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := runLoop(loopConfig{
+		RepoPath: repo,
+		Launcher: "opencode",
+		Model:    defaultModel,
+		Agent:    defaultAgent,
+		Cooldown: 0,
+	}, strings.NewReader(""), &stdout, &stderr, cycleRunner); err != nil {
+		t.Fatalf("runLoop failed: %v\nstderr: %s", err, stderr.String())
+	}
+
+	if len(cycleRunner.fakeRunner.started) != 2 {
+		t.Fatalf("expected 2 launches, got %d", len(cycleRunner.fakeRunner.started))
+	}
+	if !strings.Contains(stderr.String(), "closed job-1") {
+		t.Fatalf("expected job-1 to be closed, stderr: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "closed job-2") {
+		t.Fatalf("expected job-2 to be closed, stderr: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "2 completed, 0 failed") {
+		t.Fatalf("expected completion summary, stderr: %s", stderr.String())
+	}
+	_ = readyCallCount
+}
+
+func TestRunLoopRespectsMaxTasks(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+
+	readyJSON := `[{"id":"job-1","title":"Task","priority":1,"issue_type":"task","created_at":"2026-03-10T10:00:00Z"}]`
+	showJSON := `[{"id":"job-1","title":"Task","description":"Details","acceptance_criteria":"Done","priority":1,"issue_type":"task","created_at":"2026-03-10T10:00:00Z"}]`
+
+	cycleRunner := &cycleReadyRunner{
+		fakeRunner: &fakeRunner{
+			runOutputs: map[string][]byte{
+				commandKey("bd", "show", "job-1", "--json", "--long"):    []byte(showJSON),
+				commandKey("bd", "update", "job-1", "--claim", "--json"): []byte(`{"id":"job-1"}`),
+			},
+			lookups: map[string]error{},
+		},
+		readyOutputs: [][]byte{
+			[]byte(readyJSON),
+			[]byte(readyJSON),
+			[]byte(readyJSON),
+		},
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := runLoop(loopConfig{
+		RepoPath: repo,
+		Launcher: "opencode",
+		Model:    defaultModel,
+		Agent:    defaultAgent,
+		Cooldown: 0,
+		MaxTasks: 1,
+	}, strings.NewReader(""), &stdout, &stderr, cycleRunner); err != nil {
+		t.Fatalf("runLoop failed: %v", err)
+	}
+
+	if len(cycleRunner.fakeRunner.started) != 1 {
+		t.Fatalf("expected 1 launch with max-tasks=1, got %d", len(cycleRunner.fakeRunner.started))
+	}
+	if !strings.Contains(stderr.String(), "reached max-tasks limit") {
+		t.Fatalf("expected max-tasks log message, stderr: %s", stderr.String())
+	}
+}
+
+func TestRunLoopContinuesOnLaunchFailure(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+
+	showJSON1 := `[{"id":"job-1","title":"Fails","description":"Details","acceptance_criteria":"Done","priority":1,"issue_type":"task","created_at":"2026-03-10T10:00:00Z"}]`
+	showJSON2 := `[{"id":"job-2","title":"Works","description":"Details","acceptance_criteria":"Done","priority":2,"issue_type":"task","created_at":"2026-03-10T11:00:00Z"}]`
+
+	cycleRunner := &cycleReadyRunner{
+		fakeRunner: &fakeRunner{
+			runOutputs: map[string][]byte{
+				commandKey("bd", "show", "job-1", "--json", "--long"):    []byte(showJSON1),
+				commandKey("bd", "show", "job-2", "--json", "--long"):    []byte(showJSON2),
+				commandKey("bd", "update", "job-1", "--claim", "--json"): []byte(`{"id":"job-1"}`),
+				commandKey("bd", "update", "job-2", "--claim", "--json"): []byte(`{"id":"job-2"}`),
+			},
+			lookups: map[string]error{},
+		},
+		readyOutputs: [][]byte{
+			[]byte(`[{"id":"job-1","title":"Fails","priority":1,"issue_type":"task","created_at":"2026-03-10T10:00:00Z"}]`),
+			[]byte(`[{"id":"job-2","title":"Works","priority":2,"issue_type":"task","created_at":"2026-03-10T11:00:00Z"}]`),
+			[]byte(`[]`),
+		},
+		startErrors: map[int]error{0: errors.New("agent crashed")},
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := runLoop(loopConfig{
+		RepoPath: repo,
+		Launcher: "opencode",
+		Model:    defaultModel,
+		Agent:    defaultAgent,
+		Cooldown: 0,
+	}, strings.NewReader(""), &stdout, &stderr, cycleRunner); err != nil {
+		t.Fatalf("runLoop failed: %v", err)
+	}
+
+	if !strings.Contains(stderr.String(), "job-1 failed") {
+		t.Fatalf("expected failure log for job-1, stderr: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "closed job-2") {
+		t.Fatalf("expected job-2 to be closed after job-1 failure, stderr: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "1 completed, 1 failed") {
+		t.Fatalf("expected summary with 1 completed 1 failed, stderr: %s", stderr.String())
+	}
+}
+
+// cycleReadyRunner wraps fakeRunner but cycles through different bd ready outputs
+// and optionally fails specific Start calls.
+type cycleReadyRunner struct {
+	*fakeRunner
+	readyOutputs [][]byte
+	readyIndex   int
+	startErrors  map[int]error
+	startIndex   int
+}
+
+func (c *cycleReadyRunner) Run(dir string, name string, args ...string) ([]byte, error) {
+	key := commandKey(name, args...)
+	readyKey := commandKey("bd", "ready", "--json")
+
+	if key == readyKey {
+		idx := c.readyIndex
+		if idx >= len(c.readyOutputs) {
+			return []byte(`[]`), nil
+		}
+		c.readyIndex++
+		c.fakeRunner.runs = append(c.fakeRunner.runs, invocation{dir: dir, name: name, args: append([]string{}, args...)})
+		return c.readyOutputs[idx], nil
+	}
+
+	// Match bd close commands dynamically (any reason string).
+	if name == "bd" && len(args) >= 1 && args[0] == "close" {
+		c.fakeRunner.runs = append(c.fakeRunner.runs, invocation{dir: dir, name: name, args: append([]string{}, args...)})
+		return []byte(`{}`), nil
+	}
+
+	return c.fakeRunner.Run(dir, name, args...)
+}
+
+func (c *cycleReadyRunner) Start(dir string, stdin io.Reader, stdout io.Writer, stderr io.Writer, name string, args ...string) error {
+	idx := c.startIndex
+	c.startIndex++
+	c.fakeRunner.started = append(c.fakeRunner.started, invocation{dir: dir, name: name, args: append([]string{}, args...)})
+	if c.startErrors != nil {
+		if err := c.startErrors[idx]; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *cycleReadyRunner) LookPath(file string) (string, error) {
+	return c.fakeRunner.LookPath(file)
 }
 
 func containsArg(args []string, flag string, value string) bool {

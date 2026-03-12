@@ -8,13 +8,16 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -102,11 +105,19 @@ func Run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) err
 	return run(args, stdin, stdout, stderr, execRunner{})
 }
 
-func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer, cmd runner) error {
-	_ = stderr
+type loopConfig struct {
+	RepoPath string
+	Launcher string
+	Model    string
+	Agent    string
+	Cooldown time.Duration
+	MaxTasks int
+	Config   string
+}
 
+func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer, cmd runner) error {
 	if len(args) == 0 {
-		return errors.New("usage: autopilot <next|version> [flags]")
+		return errors.New("usage: autopilot <next|loop|version> [flags]")
 	}
 
 	switch args[0] {
@@ -116,6 +127,12 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer, cmd
 			return err
 		}
 		return runNext(cfg, stdin, stdout, stderr, cmd)
+	case "loop":
+		cfg, err := parseLoopArgs(args[1:])
+		if err != nil {
+			return err
+		}
+		return runLoop(cfg, stdin, stdout, stderr, cmd)
 	case "version":
 		_, err := fmt.Fprintf(stdout, "%s (%s)\n", version, ref)
 		return err
@@ -182,6 +199,65 @@ func parseNextArgs(args []string) (config, error) {
 	}
 
 	return merged, nil
+}
+
+func parseLoopArgs(args []string) (loopConfig, error) {
+	fs := flag.NewFlagSet("loop", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	defaultCfgPath, err := defaultConfigPath()
+	if err != nil {
+		return loopConfig{}, err
+	}
+
+	var cfg loopConfig
+	fs.StringVar(&cfg.RepoPath, "repo", ".", "target repository path")
+	fs.StringVar(&cfg.Launcher, "launcher", "", "launcher to use: opencode or claude")
+	fs.StringVar(&cfg.Model, "model", defaultModel, "model id")
+	fs.StringVar(&cfg.Agent, "agent", defaultAgent, "agent id (opencode only)")
+	fs.DurationVar(&cfg.Cooldown, "cooldown", 10*time.Second, "pause between tasks")
+	fs.IntVar(&cfg.MaxTasks, "max-tasks", 0, "maximum tasks to process (0 = unlimited)")
+	fs.StringVar(&cfg.Config, "config", defaultCfgPath, "config file path")
+
+	if err := fs.Parse(args); err != nil {
+		return loopConfig{}, err
+	}
+
+	// Merge file config for defaults.
+	fileCfg, err := loadFileConfig(cfg.Config)
+	if err != nil {
+		return loopConfig{}, err
+	}
+	if cfg.RepoPath == "." && fileCfg.RepoPath != "" {
+		cfg.RepoPath = fileCfg.RepoPath
+	}
+	if cfg.Launcher == "" && fileCfg.Launcher != "" {
+		cfg.Launcher = fileCfg.Launcher
+	}
+	if cfg.Model == defaultModel && fileCfg.Model != "" {
+		cfg.Model = fileCfg.Model
+	}
+	if cfg.Agent == defaultAgent && fileCfg.Agent != "" {
+		cfg.Agent = fileCfg.Agent
+	}
+
+	if cfg.Launcher == "" {
+		cfg.Launcher = defaultLauncher
+	}
+	if err := validateLauncher(cfg.Launcher); err != nil {
+		return loopConfig{}, err
+	}
+	if cfg.Launcher == "claude" && cfg.Model == defaultModel {
+		cfg.Model = defaultClaudeMode
+	}
+	if cfg.Launcher == "claude" {
+		cfg.Agent = ""
+	}
+	if cfg.RepoPath == "" {
+		cfg.RepoPath = "."
+	}
+
+	return cfg, nil
 }
 
 func mergeConfig(cli config) (config, error) {
@@ -336,6 +412,124 @@ func runNext(cfg config, stdin io.Reader, stdout io.Writer, stderr io.Writer, cm
 
 	fmt.Fprintf(stdout, "launching %s for %s\n", cfg.Launcher, selected.ID)
 	return cmd.Start(repoRoot, stdin, stdout, stderr, cfg.Launcher, launchArgs...)
+}
+
+func runLoop(cfg loopConfig, stdin io.Reader, stdout io.Writer, stderr io.Writer, cmd runner) error {
+	logger := log.New(stderr, "", log.Ldate|log.Ltime)
+
+	if _, err := cmd.LookPath("bd"); err != nil {
+		return errors.New("bd not found in PATH")
+	}
+	if _, err := cmd.LookPath(cfg.Launcher); err != nil {
+		return fmt.Errorf("%s not found in PATH", cfg.Launcher)
+	}
+
+	repoRoot, err := resolveRepoRoot(cfg.RepoPath)
+	if err != nil {
+		return err
+	}
+
+	repoName := filepath.Base(repoRoot)
+	logger.Printf("loop: starting for %s (launcher=%s, cooldown=%s)", repoName, cfg.Launcher, cfg.Cooldown)
+
+	// Handle graceful shutdown.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	completed := 0
+	failed := 0
+
+	for iteration := 1; ; iteration++ {
+		// Check for shutdown signal before starting next task.
+		select {
+		case sig := <-sigCh:
+			logger.Printf("loop: received %s, stopping after %d completed, %d failed", sig, completed, failed)
+			return nil
+		default:
+		}
+
+		if cfg.MaxTasks > 0 && completed >= cfg.MaxTasks {
+			logger.Printf("loop: reached max-tasks limit (%d), stopping", cfg.MaxTasks)
+			break
+		}
+
+		logger.Printf("loop: iteration %d — checking for ready issues", iteration)
+
+		ready, err := loadReadyIssues(repoRoot, cmd)
+		if err != nil {
+			logger.Printf("loop: error loading ready issues: %v", err)
+			return err
+		}
+		if len(ready) == 0 {
+			logger.Printf("loop: no ready issues remaining, stopping after %d completed, %d failed", completed, failed)
+			break
+		}
+
+		selected := ready[0]
+		logger.Printf("loop: selected %s — %s (priority=%d, type=%s)", selected.ID, selected.Title, selected.Priority, selected.IssueType)
+
+		// Load full issue details.
+		full, err := loadIssue(repoRoot, selected.ID, cmd)
+		if err != nil {
+			logger.Printf("loop: error loading issue %s: %v", selected.ID, err)
+			return err
+		}
+
+		// Claim.
+		if _, err := cmd.Run(repoRoot, "bd", "update", full.ID, "--claim", "--json"); err != nil {
+			logger.Printf("loop: error claiming %s: %v", full.ID, err)
+			return err
+		}
+		logger.Printf("loop: claimed %s", full.ID)
+
+		// Build and launch.
+		prompt := buildRP1Prompt(repoRoot, full)
+		nextCfg := config{
+			Launcher: cfg.Launcher,
+			Model:    cfg.Model,
+			Agent:    cfg.Agent,
+		}
+		launchArgs, err := buildLaunchArgs(nextCfg, repoRoot, prompt)
+		if err != nil {
+			logger.Printf("loop: error building launch args for %s: %v", full.ID, err)
+			return err
+		}
+
+		logger.Printf("loop: launching %s for %s", cfg.Launcher, full.ID)
+		startTime := time.Now()
+		launchErr := cmd.Start(repoRoot, stdin, stdout, stderr, cfg.Launcher, launchArgs...)
+		elapsed := time.Since(startTime).Truncate(time.Second)
+
+		if launchErr != nil {
+			failed++
+			logger.Printf("loop: %s failed after %s — %v (completed=%d, failed=%d)", full.ID, elapsed, launchErr, completed, failed)
+		} else {
+			// Close the issue on success.
+			reason := fmt.Sprintf("Completed by autopilot loop (launcher=%s, elapsed=%s)", cfg.Launcher, elapsed)
+			if _, err := cmd.Run(repoRoot, "bd", "close", full.ID, "--reason", reason, "--json"); err != nil {
+				logger.Printf("loop: warning: failed to close %s: %v", full.ID, err)
+			} else {
+				logger.Printf("loop: closed %s", full.ID)
+			}
+			completed++
+			logger.Printf("loop: %s completed in %s (completed=%d, failed=%d)", full.ID, elapsed, completed, failed)
+		}
+
+		// Cooldown before next iteration.
+		if cfg.Cooldown > 0 {
+			logger.Printf("loop: cooling down %s before next task", cfg.Cooldown)
+			select {
+			case sig := <-sigCh:
+				logger.Printf("loop: received %s during cooldown, stopping after %d completed, %d failed", sig, completed, failed)
+				return nil
+			case <-time.After(cfg.Cooldown):
+			}
+		}
+	}
+
+	logger.Printf("loop: done — %d completed, %d failed", completed, failed)
+	return nil
 }
 
 func buildLaunchArgs(cfg config, repoRoot string, prompt string) ([]string, error) {
@@ -516,7 +710,7 @@ func printIssues(out io.Writer, issues []issue) {
 func buildRP1Prompt(repoRoot string, item issue) string {
 	requirement := buildRequirementName(item)
 	description := buildRequirementDescription(repoRoot, item)
-	return fmt.Sprintf(`/rp1-build %s %s --git-pr --afk`, quoteSlashArg(requirement), quoteSlashArg(description))
+	return fmt.Sprintf(`/rp1-build %s %s --afk`, quoteSlashArg(requirement), quoteSlashArg(description))
 }
 
 func buildRequirementName(item issue) string {

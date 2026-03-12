@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.0] - 2026-03-11
+
+### Added
+- `autopilot loop` command for continuous processing of all ready Beads issues
+- Proper logging with timestamps to stderr for loop operations
+- `--cooldown` flag to control pause between tasks (default 10s)
+- `--max-tasks` flag to limit number of issues processed per loop run
+- Graceful shutdown on SIGINT/SIGTERM during loop
+- Automatic `bd close` on successful agent completion
+
+### Changed
+- Removed `--git-pr` from generated `/rp1-build` prompts (agents commit to branch, no PR created)
+
 ## [0.1.1] - 2026-03-11
 
 ### Fixed
