@@ -59,6 +59,7 @@ type config struct {
 	Model       string
 	Agent       string
 	Effort      string
+	Print       bool // use --print mode (non-interactive, exits when done)
 	DryRun      bool
 	PrintPrompt bool
 	Pick        bool
@@ -879,6 +880,7 @@ func shellJoinArgs(args []string) string {
 }
 
 // launchAgent starts a short-lived agent session with the given prompt.
+// Uses --print mode so the agent exits when done instead of waiting for input.
 // An optional roleOverride can adjust model/effort for specific roles (reviewer, fixer).
 func launchAgent(cfg loopConfig, repoRoot string, prompt string, role roleOverride, stdin io.Reader, stdout io.Writer, stderr io.Writer, cmd runner) error {
 	agentCfg := config{
@@ -886,6 +888,7 @@ func launchAgent(cfg loopConfig, repoRoot string, prompt string, role roleOverri
 		Model:    cfg.Model,
 		Agent:    cfg.Agent,
 		Effort:   cfg.Effort,
+		Print:    true,
 	}
 	if role.Model != "" {
 		agentCfg.Model = role.Model
@@ -1064,7 +1067,11 @@ func buildLaunchArgs(cfg config, repoRoot string, prompt string) ([]string, erro
 		args = append(args, repoRoot)
 		return args, nil
 	case "claude":
-		args := []string{"--model", cfg.Model, "--dangerously-skip-permissions", "--effort", cfg.Effort, prompt}
+		args := []string{"--model", cfg.Model, "--dangerously-skip-permissions", "--effort", cfg.Effort}
+		if cfg.Print {
+			args = append(args, "--print")
+		}
+		args = append(args, prompt)
 		return args, nil
 	default:
 		return nil, fmt.Errorf("unsupported launcher %q", cfg.Launcher)

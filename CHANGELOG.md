@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.8.0] - 2026-03-12
+
+### Changed
+- Review and fix agents now launch with `--print` mode — they exit when done instead of idling at a prompt, allowing autopilot to proceed to the push/merge steps
+
 ## [0.7.9] - 2026-03-12
 
 ### Fixed
