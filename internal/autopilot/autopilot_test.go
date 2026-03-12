@@ -251,6 +251,9 @@ func TestRunNextLaunchesClaudeWhenRequested(t *testing.T) {
 	if !containsArg(fake.started[0].args, "--model", defaultClaudeMode) {
 		t.Fatalf("expected claude default model in args: %#v", fake.started[0].args)
 	}
+	if !containsFlag(fake.started[0].args, "--dangerously-skip-permissions") {
+		t.Fatalf("expected --dangerously-skip-permissions for claude launch: %#v", fake.started[0].args)
+	}
 	if containsFlag(fake.started[0].args, "--agent") {
 		t.Fatalf("did not expect --agent for claude launch: %#v", fake.started[0].args)
 	}

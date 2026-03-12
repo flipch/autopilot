@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.1] - 2026-03-11
+
+### Fixed
+- Claude launcher now includes `--dangerously-skip-permissions` so agent sessions run unattended
+
 ## [0.3.0] - 2026-03-11
 
 ### Added

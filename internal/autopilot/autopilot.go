@@ -758,7 +758,7 @@ func buildLaunchArgs(cfg config, repoRoot string, prompt string) ([]string, erro
 		args = append(args, repoRoot)
 		return args, nil
 	case "claude":
-		args := []string{"--model", cfg.Model, prompt}
+		args := []string{"--model", cfg.Model, "--dangerously-skip-permissions", prompt}
 		return args, nil
 	default:
 		return nil, fmt.Errorf("unsupported launcher %q", cfg.Launcher)
