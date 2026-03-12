@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.7.4] - 2026-03-12
+
+### Fixed
+- All `/rp1-build` prompts now include `--git-worktree` for isolated worktree per task — prevents parallel workers from stepping on each other in the same repo directory
+
 ## [0.7.3] - 2026-03-12
 
 ### Fixed

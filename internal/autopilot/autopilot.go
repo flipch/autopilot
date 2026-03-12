@@ -1185,10 +1185,11 @@ func printIssues(out io.Writer, issues []issue) {
 func buildRP1Prompt(repoRoot string, item issue, gitPR bool) string {
 	requirement := buildRequirementName(item)
 	description := buildRequirementDescription(repoRoot, item)
+	flags := "--git-worktree --afk"
 	if gitPR {
-		return fmt.Sprintf(`/rp1-build %s %s --git-pr --afk`, quoteSlashArg(requirement), quoteSlashArg(description))
+		flags = "--git-worktree --git-pr --afk"
 	}
-	return fmt.Sprintf(`/rp1-build %s %s --afk`, quoteSlashArg(requirement), quoteSlashArg(description))
+	return fmt.Sprintf(`/rp1-build %s %s %s`, quoteSlashArg(requirement), quoteSlashArg(description), flags)
 }
 
 func buildRequirementName(item issue) string {
