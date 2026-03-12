@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.8.1] - 2026-03-12
+
+### Fixed
+- Build agent now also uses `--print` mode so claude exits after `/rp1-build --afk` completes, allowing autopilot to proceed to the review cycle
+
 ## [0.8.0] - 2026-03-12
 
 ### Changed

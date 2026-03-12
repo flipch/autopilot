@@ -650,6 +650,7 @@ func runWorker(cfg loopConfig, repoRoot string, stopCh <-chan struct{}, stdin io
 			Model:    cfg.Model,
 			Agent:    cfg.Agent,
 			Effort:   cfg.Effort,
+			Print:    true,
 		}
 		launchArgs, err := buildLaunchArgs(nextCfg, repoRoot, prompt)
 		if err != nil {
