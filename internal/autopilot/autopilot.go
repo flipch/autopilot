@@ -613,21 +613,33 @@ func runWorker(cfg loopConfig, repoRoot string, stopCh <-chan struct{}, stdin io
 			break
 		}
 
-		selected := ready[0]
-		logger.Printf("selected %s — %s (priority=%d, type=%s)", selected.ID, selected.Title, selected.Priority, selected.IssueType)
-
-		full, err := loadIssue(repoRoot, selected.ID, cmd)
-		if err != nil {
-			logger.Printf("error loading issue %s: %v", selected.ID, err)
+		// Try to claim any ready issue, skipping ones already taken.
+		var full issue
+		claimed := false
+		for _, candidate := range ready {
+			if _, err := cmd.Run(repoRoot, "bd", "update", candidate.ID, "--claim", "--json"); err != nil {
+				logger.Printf("claim failed for %s (taken by another worker), trying next", candidate.ID)
+				continue
+			}
+			full, err = loadIssue(repoRoot, candidate.ID, cmd)
+			if err != nil {
+				logger.Printf("error loading issue %s after claim: %v", candidate.ID, err)
+				continue
+			}
+			claimed = true
 			break
 		}
-
-		// Claim — may fail if another worker got it first.
-		if _, err := cmd.Run(repoRoot, "bd", "update", full.ID, "--claim", "--json"); err != nil {
-			logger.Printf("claim failed for %s (likely taken by another worker), retrying", full.ID)
+		if !claimed {
+			// All ready issues were taken by other workers. Back off and retry.
+			logger.Printf("all %d ready issues claimed by other workers, backing off", len(ready))
+			select {
+			case <-stopCh:
+				return completed, failed
+			case <-time.After(5 * time.Second):
+			}
 			continue
 		}
-		logger.Printf("claimed %s", full.ID)
+		logger.Printf("claimed %s — %s (priority=%d, type=%s)", full.ID, full.Title, full.Priority, full.IssueType)
 
 		// Build and launch.
 		prompt := buildRP1Prompt(repoRoot, full, cfg.Review)

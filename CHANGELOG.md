@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.1] - 2026-03-12
+
+### Fixed
+- Workers no longer hot-loop on already-claimed issues — they now iterate through the ready list and skip claimed ones
+- 5-second backoff when all ready issues are taken by other workers
+
 ## [0.7.0] - 2026-03-12
 
 ### Added

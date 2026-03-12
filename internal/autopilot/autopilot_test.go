@@ -129,7 +129,7 @@ func TestRunNextDryRunPrintsLaunchCommand(t *testing.T) {
 	}
 
 	var stdout bytes.Buffer
-	if err := run([]string{"next", "--repo", repo, "--dry-run"}, strings.NewReader(""), &stdout, &stdout, fake); err != nil {
+	if err := run([]string{"next", "--repo", repo, "--dry-run", "--config", "/nonexistent/config.json"}, strings.NewReader(""), &stdout, &stdout, fake); err != nil {
 		t.Fatalf("run failed: %v", err)
 	}
 
@@ -160,7 +160,7 @@ func TestRunNextPrintPromptOnly(t *testing.T) {
 	}
 
 	var stdout bytes.Buffer
-	if err := run([]string{"next", "--repo", repo, "--print-prompt"}, strings.NewReader(""), &stdout, &stdout, fake); err != nil {
+	if err := run([]string{"next", "--repo", repo, "--print-prompt", "--config", "/nonexistent/config.json"}, strings.NewReader(""), &stdout, &stdout, fake); err != nil {
 		t.Fatalf("run failed: %v", err)
 	}
 
@@ -245,7 +245,7 @@ func TestRunNextLaunchesClaudeWhenRequested(t *testing.T) {
 	}
 
 	var stdout bytes.Buffer
-	if err := run([]string{"next", "--repo", repo, "--launcher", "claude", "--no-claim"}, strings.NewReader(""), &stdout, &stdout, fake); err != nil {
+	if err := run([]string{"next", "--repo", repo, "--launcher", "claude", "--no-claim", "--config", "/nonexistent/config.json"}, strings.NewReader(""), &stdout, &stdout, fake); err != nil {
 		t.Fatalf("run failed: %v", err)
 	}
 
@@ -288,7 +288,7 @@ func TestRunNextClaimsAndLaunchesSelectedIssue(t *testing.T) {
 	}
 
 	var stdout bytes.Buffer
-	if err := run([]string{"next", "--repo", repo}, strings.NewReader(""), &stdout, &stdout, fake); err != nil {
+	if err := run([]string{"next", "--repo", repo, "--config", "/nonexistent/config.json"}, strings.NewReader(""), &stdout, &stdout, fake); err != nil {
 		t.Fatalf("run failed: %v", err)
 	}
 
