@@ -781,18 +781,17 @@ func launchZellij(cfg loopConfig, repoRoot string, workerCount int, cmd runner) 
 	}
 
 	// Not in zellij — generate layout and launch a new session.
+	// Write layout to a stable path (not temp) because syscall.Exec replaces the process
+	// and deferred cleanup would race with zellij reading the file.
 	layout := buildZellijLayout(workerCount, workerArgs)
-	layoutFile, err := os.CreateTemp("", "autopilot-layout-*.kdl")
-	if err != nil {
-		return fmt.Errorf("create layout file: %w", err)
+	layoutDir := filepath.Join(repoRoot, ".autopilot")
+	if err := os.MkdirAll(layoutDir, 0o755); err != nil {
+		return fmt.Errorf("create .autopilot dir: %w", err)
 	}
-	defer os.Remove(layoutFile.Name())
-
-	if _, err := layoutFile.WriteString(layout); err != nil {
-		layoutFile.Close()
+	layoutPath := filepath.Join(layoutDir, "zellij-layout.kdl")
+	if err := os.WriteFile(layoutPath, []byte(layout), 0o644); err != nil {
 		return fmt.Errorf("write layout file: %w", err)
 	}
-	layoutFile.Close()
 
 	sessionName := fmt.Sprintf("autopilot-%s", repoName)
 
@@ -802,7 +801,7 @@ func launchZellij(cfg loopConfig, repoRoot string, workerCount int, cmd runner) 
 		return fmt.Errorf("resolve zellij path: %w", err)
 	}
 	return syscall.Exec(zellijPath, []string{
-		"zellij", "--session", sessionName, "--layout", layoutFile.Name(),
+		"zellij", "--session", sessionName, "--layout", layoutPath,
 	}, filteredEnv("CLAUDECODE", "CLAUDE_CODE"))
 }
 

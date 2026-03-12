@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.2] - 2026-03-12
+
+### Fixed
+- Zellij layout file no longer deleted before zellij can read it (was causing "no active session" errors)
+- Layout written to `<repo>/.autopilot/zellij-layout.kdl` instead of a temp file that raced with `syscall.Exec`
+
 ## [0.7.1] - 2026-03-12
 
 ### Fixed
