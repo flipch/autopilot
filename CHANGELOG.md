@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.8.2] - 2026-03-12
+
+### Changed
+- All claude agents (build, review, fix) use `--print` mode consistently for clean exit behavior
+
 ## [0.8.1] - 2026-03-12
 
 ### Fixed
