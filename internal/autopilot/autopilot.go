@@ -760,29 +760,13 @@ func runWorker(cfg loopConfig, repoRoot string, stopCh <-chan struct{}, stdin io
 	return completed, failed
 }
 
-// launchZellij spawns workers in zellij panes. If already inside a zellij
-// session (ZELLIJ env var set), it adds panes to the current session.
-// Otherwise, it generates a layout file and exec's into a new zellij session.
+// launchZellij spawns workers in zellij panes using a KDL layout.
+// If already inside a zellij session, adds a new tab with the layout.
+// Otherwise, creates a new zellij session.
 func launchZellij(cfg loopConfig, repoRoot string, workerCount int, cmd runner) error {
 	repoName := filepath.Base(repoRoot)
 	workerArgs := buildWorkerArgs(cfg, repoRoot)
 
-	if os.Getenv("ZELLIJ") != "" {
-		// Already in a zellij session — add panes.
-		for i := 1; i <= workerCount; i++ {
-			name := fmt.Sprintf("worker-%d", i)
-			paneArgs := []string{"action", "new-pane", "--name", name, "--cwd", repoRoot, "--"}
-			paneArgs = append(paneArgs, workerArgs...)
-			if _, err := cmd.Run(repoRoot, "zellij", paneArgs...); err != nil {
-				return fmt.Errorf("zellij new-pane for %s: %w", name, err)
-			}
-		}
-		return nil
-	}
-
-	// Not in zellij — generate layout and launch a new session.
-	// Write layout to a stable path (not temp) because syscall.Exec replaces the process
-	// and deferred cleanup would race with zellij reading the file.
 	layout := buildZellijLayout(workerCount, workerArgs)
 	layoutDir := filepath.Join(repoRoot, ".autopilot")
 	if err := os.MkdirAll(layoutDir, 0o755); err != nil {
@@ -793,15 +777,21 @@ func launchZellij(cfg loopConfig, repoRoot string, workerCount int, cmd runner) 
 		return fmt.Errorf("write layout file: %w", err)
 	}
 
-	sessionName := fmt.Sprintf("autopilot-%s", repoName)
-
-	// Exec replaces the current process with zellij.
 	zellijPath, err := cmd.LookPath("zellij")
 	if err != nil {
 		return fmt.Errorf("resolve zellij path: %w", err)
 	}
+
+	if os.Getenv("ZELLIJ") != "" {
+		// Already in a zellij session — add workers as a new tab via --layout.
+		_, err := cmd.Run(repoRoot, "zellij", "action", "new-tab", "--layout", layoutPath)
+		return err
+	}
+
+	// Not in zellij — exec into a new session.
+	sessionName := fmt.Sprintf("autopilot-%s", repoName)
 	return syscall.Exec(zellijPath, []string{
-		"zellij", "--session", sessionName, "--layout", layoutPath,
+		"zellij", "--session", sessionName, "--new-session-with-layout", layoutPath,
 	}, filteredEnv("CLAUDECODE", "CLAUDE_CODE"))
 }
 
@@ -835,32 +825,30 @@ func buildWorkerArgs(cfg loopConfig, repoRoot string) []string {
 	return args
 }
 
-// buildZellijLayout generates a KDL layout with N worker panes.
+// buildZellijLayout generates a KDL layout with each worker in its own tab.
 func buildZellijLayout(workerCount int, workerArgs []string) string {
 	var buf bytes.Buffer
 	buf.WriteString("layout {\n")
 
-	// Tab bar.
-	buf.WriteString("    pane size=1 borderless=true {\n")
-	buf.WriteString("        plugin location=\"tab-bar\"\n")
-	buf.WriteString("    }\n")
-
+	// Each worker gets a full-screen tab.
 	for i := 1; i <= workerCount; i++ {
-		// Quote the command as the first arg, rest as args.
-		buf.WriteString(fmt.Sprintf("    pane name=\"worker-%d\" {\n", i))
-		buf.WriteString(fmt.Sprintf("        command %q\n", workerArgs[0]))
-		buf.WriteString("        args")
+		buf.WriteString(fmt.Sprintf("    tab name=\"worker-%d\" {\n", i))
+		buf.WriteString("        pane size=1 borderless=true {\n")
+		buf.WriteString("            plugin location=\"tab-bar\"\n")
+		buf.WriteString("        }\n")
+		buf.WriteString(fmt.Sprintf("        pane name=\"worker-%d\" {\n", i))
+		buf.WriteString(fmt.Sprintf("            command %q\n", workerArgs[0]))
+		buf.WriteString("            args")
 		for _, arg := range workerArgs[1:] {
 			buf.WriteString(fmt.Sprintf(" %q", arg))
 		}
 		buf.WriteString("\n")
+		buf.WriteString("        }\n")
+		buf.WriteString("        pane size=1 borderless=true {\n")
+		buf.WriteString("            plugin location=\"status-bar\"\n")
+		buf.WriteString("        }\n")
 		buf.WriteString("    }\n")
 	}
-
-	// Status bar.
-	buf.WriteString("    pane size=1 borderless=true {\n")
-	buf.WriteString("        plugin location=\"status-bar\"\n")
-	buf.WriteString("    }\n")
 
 	buf.WriteString("}\n")
 	return buf.String()

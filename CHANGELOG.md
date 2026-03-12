@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.3] - 2026-03-12
+
+### Fixed
+- Zellij layout now uses one **tab per worker** instead of cramming all panes into a single view
+- Use `--new-session-with-layout` for new sessions, `action new-tab --layout` when already inside zellij
+- Both paths use the same layout file
+
 ## [0.7.2] - 2026-03-12
 
 ### Fixed
