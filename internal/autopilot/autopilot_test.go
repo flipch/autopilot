@@ -507,15 +507,6 @@ func TestRunLoopWithReviewCycleApproves(t *testing.T) {
 		t.Fatalf("mkdir .git: %v", err)
 	}
 
-	// Create a review verdict file that says approve.
-	reviewDir := filepath.Join(repo, ".rp1", "work", "pr-reviews")
-	if err := os.MkdirAll(reviewDir, 0o755); err != nil {
-		t.Fatalf("mkdir review dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(reviewDir, "review-001.md"), []byte("## Judgment\n\nVerdict: `approve`\n\nLooks good."), 0o644); err != nil {
-		t.Fatalf("write review: %v", err)
-	}
-
 	showJSON := `[{"id":"job-1","title":"Add feature","description":"Details","acceptance_criteria":"Done","priority":1,"issue_type":"task","created_at":"2026-03-10T10:00:00Z"}]`
 
 	cycleRunner := &cycleReadyRunner{
@@ -530,9 +521,9 @@ func TestRunLoopWithReviewCycleApproves(t *testing.T) {
 			[]byte(`[{"id":"job-1","title":"Add feature","priority":1,"issue_type":"task","created_at":"2026-03-10T10:00:00Z"}]`),
 			[]byte(`[]`),
 		},
-		// gh pr list returns PR #10, gh pr merge succeeds.
-		ghPRListOutput: []byte(`[{"number":10}]`),
-		ghPRMergeOK:    true,
+		ghPRListOutput:   []byte(`[{"number":10}]`),
+		ghPRViewDecision: "APPROVED",
+		ghPRMergeOK:      true,
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -898,9 +889,10 @@ type cycleReadyRunner struct {
 	readyIndex     int
 	startErrors    map[int]error
 	startIndex     int
-	ghPRListOutput []byte
-	ghPRMergeOK    bool
-	onStart        func(idx int, args []string)
+	ghPRListOutput    []byte
+	ghPRMergeOK       bool
+	ghPRViewDecision  string // e.g. "APPROVED", "CHANGES_REQUESTED", or "" to fall through to file
+	onStart           func(idx int, args []string)
 }
 
 func (c *cycleReadyRunner) Run(dir string, name string, args ...string) ([]byte, error) {
@@ -933,6 +925,15 @@ func (c *cycleReadyRunner) Run(dir string, name string, args ...string) ([]byte,
 			return c.ghPRListOutput, nil
 		}
 		return []byte(`[]`), nil
+	}
+
+	// Handle gh pr view (for detectVerdict).
+	if name == "gh" && len(args) >= 2 && args[0] == "pr" && args[1] == "view" {
+		c.fakeRunner.runs = append(c.fakeRunner.runs, invocation{dir: dir, name: name, args: append([]string{}, args...)})
+		if c.ghPRViewDecision != "" {
+			return []byte(c.ghPRViewDecision), nil
+		}
+		return []byte(""), nil
 	}
 
 	// Handle gh pr merge.

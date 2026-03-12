@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.0] - 2026-03-12
+
+### Added
+- `--effort` flag (default `max`) for controlling Claude thinking effort level (low, medium, high, max)
+- Per-role model/effort overrides via config file `roles` section (builder, reviewer, fixer)
+- `detectVerdict` function — checks GitHub PR review decision first, falls back to file parsing
+- Injects `RP1_PR_REVIEW_VERDICT=auto` and `RP1_PR_REVIEW_ADD_COMMENTS=true` env vars so `/pr-review` posts a real GitHub review for reliable verdict detection
+
+### Changed
+- Review verdict detection no longer depends solely on parsing natural language from review files
+
 ## [0.6.1] - 2026-03-12
 
 ### Changed

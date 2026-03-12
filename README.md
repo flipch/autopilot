@@ -169,12 +169,19 @@ Example:
 ```json
 {
   "repo": "/Users/felipeh/Development/jobber",
-  "launcher": "opencode",
-  "model": "anthropic/claude-opus-4-6",
-  "agent": "opencoder",
-  "no_claim": false
+  "launcher": "claude",
+  "model": "opus",
+  "effort": "max",
+  "no_claim": false,
+  "roles": {
+    "builder":  { "model": "opus",   "effort": "max"  },
+    "reviewer": { "model": "sonnet", "effort": "high" },
+    "fixer":    { "model": "sonnet", "effort": "high" }
+  }
 }
 ```
+
+The `roles` section lets you use different models/effort levels for each step of the review cycle. Builder does the heavy implementation work, reviewer analyzes the PR, fixer addresses feedback. Omit any role to use the top-level defaults.
 
 CLI flags override config values.
 

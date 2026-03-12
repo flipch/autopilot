@@ -24,11 +24,12 @@ import (
 )
 
 const (
-	defaultLauncher   = "opencode"
-	defaultModel      = "anthropic/claude-opus-4-6"
-	defaultClaudeMode = "opus"
-	defaultAgent      = "opencoder"
-	maxParallel       = 5
+	defaultLauncher    = "opencode"
+	defaultModel       = "anthropic/claude-opus-4-6"
+	defaultClaudeMode  = "opus"
+	defaultAgent       = "opencoder"
+	defaultClaudeEffort = "max"
+	maxParallel        = 5
 )
 
 var errUsage = errors.New("usage")
@@ -57,6 +58,7 @@ type config struct {
 	Launcher    string
 	Model       string
 	Agent       string
+	Effort      string
 	DryRun      bool
 	PrintPrompt bool
 	Pick        bool
@@ -66,11 +68,25 @@ type config struct {
 }
 
 type fileConfig struct {
-	RepoPath string `json:"repo"`
-	Launcher string `json:"launcher"`
-	Model    string `json:"model"`
-	Agent    string `json:"agent"`
-	NoClaim  bool   `json:"no_claim"`
+	RepoPath string     `json:"repo"`
+	Launcher string     `json:"launcher"`
+	Model    string     `json:"model"`
+	Agent    string     `json:"agent"`
+	Effort   string     `json:"effort"`
+	NoClaim  bool       `json:"no_claim"`
+	Roles    roleConfig `json:"roles"`
+}
+
+// roleConfig allows per-role model/effort overrides.
+type roleConfig struct {
+	Builder  roleOverride `json:"builder"`
+	Reviewer roleOverride `json:"reviewer"`
+	Fixer    roleOverride `json:"fixer"`
+}
+
+type roleOverride struct {
+	Model  string `json:"model"`
+	Effort string `json:"effort"`
 }
 
 type runner interface {
@@ -102,12 +118,17 @@ func (execRunner) Start(dir string, stdin io.Reader, stdout io.Writer, stderr io
 	return cmd.Run()
 }
 
-// filteredEnv returns os.Environ() with the named variables removed.
+// filteredEnv returns os.Environ() with the named variables removed and
+// autopilot-specific env vars injected for rp1 integration.
 func filteredEnv(names ...string) []string {
 	skip := make(map[string]bool, len(names))
 	for _, n := range names {
 		skip[n] = true
 	}
+	// Also strip vars we inject below to avoid duplicates.
+	skip["RP1_PR_REVIEW_VERDICT"] = true
+	skip["RP1_PR_REVIEW_ADD_COMMENTS"] = true
+
 	var env []string
 	for _, e := range os.Environ() {
 		key := e[:strings.IndexByte(e, '=')]
@@ -115,6 +136,8 @@ func filteredEnv(names ...string) []string {
 			env = append(env, e)
 		}
 	}
+	// Ensure /pr-review posts a GitHub review so autopilot can read the verdict.
+	env = append(env, "RP1_PR_REVIEW_VERDICT=auto", "RP1_PR_REVIEW_ADD_COMMENTS=true")
 	return env
 }
 
@@ -131,6 +154,7 @@ type loopConfig struct {
 	Launcher        string
 	Model           string
 	Agent           string
+	Effort          string
 	Cooldown        time.Duration
 	MaxTasks        int
 	Parallel        int
@@ -139,6 +163,7 @@ type loopConfig struct {
 	LogFile         string
 	Zellij          bool
 	Config          string
+	roles           roleConfig // from file config, used by review cycle
 }
 
 func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer, cmd runner) error {
@@ -182,6 +207,7 @@ func parseNextArgs(args []string) (config, error) {
 	fs.StringVar(&cfg.Launcher, "launcher", "", "launcher to use: opencode or claude")
 	fs.StringVar(&cfg.Model, "model", defaultModel, "OpenCode model id")
 	fs.StringVar(&cfg.Agent, "agent", defaultAgent, "OpenCode agent id")
+	fs.StringVar(&cfg.Effort, "effort", defaultClaudeEffort, "Claude thinking effort (low, medium, high, max)")
 	fs.BoolVar(&cfg.DryRun, "dry-run", false, "print selected issue and launch command without executing")
 	fs.BoolVar(&cfg.PrintPrompt, "print-prompt", false, "print the generated /rp1-build prompt and exit")
 	fs.BoolVar(&cfg.Pick, "pick", false, "interactively pick from ready issues")
@@ -241,6 +267,7 @@ func parseLoopArgs(args []string) (loopConfig, error) {
 	fs.StringVar(&cfg.Launcher, "launcher", "", "launcher to use: opencode or claude")
 	fs.StringVar(&cfg.Model, "model", defaultModel, "model id")
 	fs.StringVar(&cfg.Agent, "agent", defaultAgent, "agent id (opencode only)")
+	fs.StringVar(&cfg.Effort, "effort", defaultClaudeEffort, "Claude thinking effort (low, medium, high, max)")
 	fs.DurationVar(&cfg.Cooldown, "cooldown", 10*time.Second, "pause between tasks")
 	fs.IntVar(&cfg.MaxTasks, "max-tasks", 0, "maximum tasks to process (0 = unlimited)")
 	fs.IntVar(&cfg.Parallel, "parallel", 0, "number of parallel workers (0 = auto-detect from ready issues, max 5)")
@@ -271,6 +298,9 @@ func parseLoopArgs(args []string) (loopConfig, error) {
 	if cfg.Agent == defaultAgent && fileCfg.Agent != "" {
 		cfg.Agent = fileCfg.Agent
 	}
+	if cfg.Effort == defaultClaudeEffort && fileCfg.Effort != "" {
+		cfg.Effort = fileCfg.Effort
+	}
 
 	if cfg.Launcher == "" {
 		cfg.Launcher = defaultLauncher
@@ -287,6 +317,9 @@ func parseLoopArgs(args []string) (loopConfig, error) {
 	if cfg.RepoPath == "" {
 		cfg.RepoPath = "."
 	}
+
+	// Store role overrides from file config for use by review cycle.
+	cfg.roles = fileCfg.Roles
 
 	return cfg, nil
 }
@@ -602,6 +635,7 @@ func runWorker(cfg loopConfig, repoRoot string, stopCh <-chan struct{}, stdin io
 			Launcher: cfg.Launcher,
 			Model:    cfg.Model,
 			Agent:    cfg.Agent,
+			Effort:   cfg.Effort,
 		}
 		launchArgs, err := buildLaunchArgs(nextCfg, repoRoot, prompt)
 		if err != nil {
@@ -635,12 +669,12 @@ func runWorker(cfg loopConfig, repoRoot string, stopCh <-chan struct{}, stdin io
 				logger.Printf("review round %d/%d for PR #%d (%s)", round, cfg.MaxReviewRounds, prNumber, full.ID)
 
 				reviewPrompt := fmt.Sprintf("/pr-review %d", prNumber)
-				if err := launchAgent(cfg, repoRoot, reviewPrompt, stdin, stdout, stderr, cmd); err != nil {
+				if err := launchAgent(cfg, repoRoot, reviewPrompt, cfg.roles.Reviewer, stdin, stdout, stderr, cmd); err != nil {
 					logger.Printf("review agent failed for PR #%d: %v", prNumber, err)
 					break
 				}
 
-				verdict := parseReviewVerdict(repoRoot)
+				verdict := detectVerdict(repoRoot, prNumber, cmd)
 				logger.Printf("review verdict for PR #%d: %s", prNumber, verdict)
 
 				if verdict == verdictApprove {
@@ -659,7 +693,7 @@ func runWorker(cfg loopConfig, repoRoot string, stopCh <-chan struct{}, stdin io
 
 				logger.Printf("launching fix agent for PR #%d (round %d)", prNumber, round)
 				fixPrompt := fmt.Sprintf("/address-pr-feedback %d --afk", prNumber)
-				if err := launchAgent(cfg, repoRoot, fixPrompt, stdin, stdout, stderr, cmd); err != nil {
+				if err := launchAgent(cfg, repoRoot, fixPrompt, cfg.roles.Fixer, stdin, stdout, stderr, cmd); err != nil {
 					logger.Printf("fix agent failed for PR #%d: %v", prNumber, err)
 					break
 				}
@@ -769,6 +803,9 @@ func buildWorkerArgs(cfg loopConfig, repoRoot string) []string {
 	if cfg.Agent != "" {
 		args = append(args, "--agent", cfg.Agent)
 	}
+	if cfg.Effort != "" && cfg.Effort != defaultClaudeEffort {
+		args = append(args, "--effort", cfg.Effort)
+	}
 	if cfg.Cooldown != 10*time.Second {
 		args = append(args, "--cooldown", cfg.Cooldown.String())
 	}
@@ -819,11 +856,19 @@ func buildZellijLayout(workerCount int, workerArgs []string) string {
 }
 
 // launchAgent starts a short-lived agent session with the given prompt.
-func launchAgent(cfg loopConfig, repoRoot string, prompt string, stdin io.Reader, stdout io.Writer, stderr io.Writer, cmd runner) error {
+// An optional roleOverride can adjust model/effort for specific roles (reviewer, fixer).
+func launchAgent(cfg loopConfig, repoRoot string, prompt string, role roleOverride, stdin io.Reader, stdout io.Writer, stderr io.Writer, cmd runner) error {
 	agentCfg := config{
 		Launcher: cfg.Launcher,
 		Model:    cfg.Model,
 		Agent:    cfg.Agent,
+		Effort:   cfg.Effort,
+	}
+	if role.Model != "" {
+		agentCfg.Model = role.Model
+	}
+	if role.Effort != "" {
+		agentCfg.Effort = role.Effort
 	}
 	args, err := buildLaunchArgs(agentCfg, repoRoot, prompt)
 	if err != nil {
@@ -858,6 +903,23 @@ const (
 	verdictBlock          = "block"
 	verdictUnknown        = "unknown"
 )
+
+// detectVerdict checks for a review verdict, trying GitHub first, then the review file.
+func detectVerdict(repoRoot string, prNumber int, cmd runner) string {
+	// Primary: read the GitHub review decision set by /pr-review with RP1_PR_REVIEW_VERDICT=auto.
+	output, err := cmd.Run(repoRoot, "gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviewDecision", "-q", ".reviewDecision")
+	if err == nil {
+		switch strings.TrimSpace(string(output)) {
+		case "APPROVED":
+			return verdictApprove
+		case "CHANGES_REQUESTED":
+			return verdictRequestChanges
+		}
+	}
+
+	// Fallback: parse the review file.
+	return parseReviewVerdict(repoRoot)
+}
 
 // parseReviewVerdict reads the latest pr-review report and extracts the verdict.
 // It scans .rp1/work/pr-reviews/ for the most recently modified .md file and
@@ -956,7 +1018,7 @@ func buildLaunchArgs(cfg config, repoRoot string, prompt string) ([]string, erro
 		args = append(args, repoRoot)
 		return args, nil
 	case "claude":
-		args := []string{"--model", cfg.Model, "--dangerously-skip-permissions", "--effort", "max", prompt}
+		args := []string{"--model", cfg.Model, "--dangerously-skip-permissions", "--effort", cfg.Effort, prompt}
 		return args, nil
 	default:
 		return nil, fmt.Errorf("unsupported launcher %q", cfg.Launcher)
