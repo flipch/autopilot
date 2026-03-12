@@ -274,7 +274,7 @@ func parseLoopArgs(args []string) (loopConfig, error) {
 	fs.IntVar(&cfg.MaxTasks, "max-tasks", 0, "maximum tasks to process (0 = unlimited)")
 	fs.IntVar(&cfg.Parallel, "parallel", 0, "number of parallel workers (0 = auto-detect from ready issues, max 5)")
 	fs.BoolVar(&cfg.Review, "review", false, "enable PR review cycle (creates PR, reviews, fixes feedback, merges)")
-	fs.IntVar(&cfg.MaxReviewRounds, "max-review-rounds", 3, "maximum review/fix iterations per PR")
+	fs.IntVar(&cfg.MaxReviewRounds, "max-review-rounds", 5, "maximum review/fix iterations per PR")
 	fs.StringVar(&cfg.LogFile, "log-file", "", "write structured logs to file (in addition to stderr)")
 	fs.BoolVar(&cfg.Zellij, "zellij", false, "spawn each worker in a zellij pane (visible, interactive)")
 	fs.StringVar(&cfg.Config, "config", defaultCfgPath, "config file path")
@@ -696,10 +696,8 @@ func runWorker(cfg loopConfig, repoRoot string, stopCh <-chan struct{}, stdin io
 					approved = true
 					break
 				}
-				if verdict == verdictBlock {
-					logger.Printf("PR #%d blocked by review, skipping", prNumber)
-					break
-				}
+				// Don't bail on block — treat it like request_changes.
+				// Only stop when max rounds exhausted.
 
 				if round >= cfg.MaxReviewRounds {
 					logger.Printf("exhausted %d review rounds for PR #%d", cfg.MaxReviewRounds, prNumber)

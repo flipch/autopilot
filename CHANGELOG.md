@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.8.3] - 2026-03-12
+
+### Changed
+- "block" verdict no longer causes worker to abandon the PR — treated same as request_changes, keeps fixing until max rounds exhausted
+- Default `--max-review-rounds` increased from 3 to 5
+
 ## [0.8.2] - 2026-03-12
 
 ### Changed
