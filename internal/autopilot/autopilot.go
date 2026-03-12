@@ -893,23 +893,33 @@ func launchAgent(cfg loopConfig, repoRoot string, prompt string, role roleOverri
 	return cmd.Start(repoRoot, stdin, stdout, stderr, cfg.Launcher, args...)
 }
 
-// detectPR finds an open PR for the given head branch using gh.
-func detectPR(repoRoot string, branch string, cmd runner) (int, error) {
-	output, err := cmd.Run(repoRoot, "gh", "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "1")
-	if err != nil {
-		return 0, fmt.Errorf("gh pr list: %w", err)
+// detectPR finds an open PR for the given slug by trying multiple branch name
+// patterns. rp1 and Claude Code use different prefixes (feature-, worktree-,
+// quick-build-, or bare), so we try them all.
+func detectPR(repoRoot string, slug string, cmd runner) (int, error) {
+	candidates := []string{
+		slug,
+		"worktree-" + slug,
+		"feature-" + slug,
+		"worktree-feature-" + slug,
+		"quick-build-" + slug,
 	}
 
-	var prs []struct {
-		Number int `json:"number"`
+	for _, branch := range candidates {
+		output, err := cmd.Run(repoRoot, "gh", "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "1")
+		if err != nil {
+			continue
+		}
+		var prs []struct {
+			Number int `json:"number"`
+		}
+		if err := json.Unmarshal(output, &prs); err != nil || len(prs) == 0 {
+			continue
+		}
+		return prs[0].Number, nil
 	}
-	if err := json.Unmarshal(output, &prs); err != nil {
-		return 0, fmt.Errorf("parse PR list: %w", err)
-	}
-	if len(prs) == 0 {
-		return 0, fmt.Errorf("no open PR found for branch %s", branch)
-	}
-	return prs[0].Number, nil
+
+	return 0, fmt.Errorf("no open PR found for slug %s (tried %d branch patterns)", slug, len(candidates))
 }
 
 // Review verdict constants.

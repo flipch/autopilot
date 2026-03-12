@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.7.6] - 2026-03-12
+
+### Fixed
+- PR detection now tries multiple branch name patterns (`slug`, `worktree-slug`, `feature-slug`, `worktree-feature-slug`, `quick-build-slug`) to handle different prefixes from rp1 and Claude Code worktree systems
+
 ## [0.7.5] - 2026-03-12
 
 ### Fixed
