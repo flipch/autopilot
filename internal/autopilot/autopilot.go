@@ -106,13 +106,15 @@ func Run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) err
 }
 
 type loopConfig struct {
-	RepoPath string
-	Launcher string
-	Model    string
-	Agent    string
-	Cooldown time.Duration
-	MaxTasks int
-	Config   string
+	RepoPath       string
+	Launcher       string
+	Model          string
+	Agent          string
+	Cooldown       time.Duration
+	MaxTasks       int
+	Review         bool
+	MaxReviewRounds int
+	Config         string
 }
 
 func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer, cmd runner) error {
@@ -217,6 +219,8 @@ func parseLoopArgs(args []string) (loopConfig, error) {
 	fs.StringVar(&cfg.Agent, "agent", defaultAgent, "agent id (opencode only)")
 	fs.DurationVar(&cfg.Cooldown, "cooldown", 10*time.Second, "pause between tasks")
 	fs.IntVar(&cfg.MaxTasks, "max-tasks", 0, "maximum tasks to process (0 = unlimited)")
+	fs.BoolVar(&cfg.Review, "review", false, "enable PR review cycle (creates PR, reviews, fixes feedback, merges)")
+	fs.IntVar(&cfg.MaxReviewRounds, "max-review-rounds", 3, "maximum review/fix iterations per PR")
 	fs.StringVar(&cfg.Config, "config", defaultCfgPath, "config file path")
 
 	if err := fs.Parse(args); err != nil {
@@ -383,7 +387,7 @@ func runNext(cfg config, stdin io.Reader, stdout io.Writer, stderr io.Writer, cm
 		return err
 	}
 
-	prompt := buildRP1Prompt(repoRoot, selected)
+	prompt := buildRP1Prompt(repoRoot, selected, false)
 	launchArgs, err := buildLaunchArgs(cfg, repoRoot, prompt)
 	if err != nil {
 		return err
@@ -423,6 +427,11 @@ func runLoop(cfg loopConfig, stdin io.Reader, stdout io.Writer, stderr io.Writer
 	if _, err := cmd.LookPath(cfg.Launcher); err != nil {
 		return fmt.Errorf("%s not found in PATH", cfg.Launcher)
 	}
+	if cfg.Review {
+		if _, err := cmd.LookPath("gh"); err != nil {
+			return errors.New("gh not found in PATH (required for --review)")
+		}
+	}
 
 	repoRoot, err := resolveRepoRoot(cfg.RepoPath)
 	if err != nil {
@@ -430,7 +439,11 @@ func runLoop(cfg loopConfig, stdin io.Reader, stdout io.Writer, stderr io.Writer
 	}
 
 	repoName := filepath.Base(repoRoot)
-	logger.Printf("loop: starting for %s (launcher=%s, cooldown=%s)", repoName, cfg.Launcher, cfg.Cooldown)
+	if cfg.Review {
+		logger.Printf("loop: starting for %s (launcher=%s, review=on, max-rounds=%d, cooldown=%s)", repoName, cfg.Launcher, cfg.MaxReviewRounds, cfg.Cooldown)
+	} else {
+		logger.Printf("loop: starting for %s (launcher=%s, cooldown=%s)", repoName, cfg.Launcher, cfg.Cooldown)
+	}
 
 	// Handle graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
@@ -484,7 +497,7 @@ func runLoop(cfg loopConfig, stdin io.Reader, stdout io.Writer, stderr io.Writer
 		logger.Printf("loop: claimed %s", full.ID)
 
 		// Build and launch.
-		prompt := buildRP1Prompt(repoRoot, full)
+		prompt := buildRP1Prompt(repoRoot, full, cfg.Review)
 		nextCfg := config{
 			Launcher: cfg.Launcher,
 			Model:    cfg.Model,
@@ -503,9 +516,84 @@ func runLoop(cfg loopConfig, stdin io.Reader, stdout io.Writer, stderr io.Writer
 
 		if launchErr != nil {
 			failed++
-			logger.Printf("loop: %s failed after %s — %v (completed=%d, failed=%d)", full.ID, elapsed, launchErr, completed, failed)
+			logger.Printf("loop: %s build failed after %s — %v (completed=%d, failed=%d)", full.ID, elapsed, launchErr, completed, failed)
+			goto cooldown
+		}
+
+		if cfg.Review {
+			// Review cycle: detect PR → review → fix feedback → re-review → merge.
+			branchName := buildRequirementName(full)
+			prNumber, prErr := detectPR(repoRoot, branchName, cmd)
+			if prErr != nil {
+				failed++
+				logger.Printf("loop: no PR found for %s (branch %s): %v", full.ID, branchName, prErr)
+				goto cooldown
+			}
+			logger.Printf("loop: detected PR #%d for %s", prNumber, full.ID)
+
+			approved := false
+			for round := 1; round <= cfg.MaxReviewRounds; round++ {
+				logger.Printf("loop: review round %d/%d for PR #%d (%s)", round, cfg.MaxReviewRounds, prNumber, full.ID)
+
+				// Launch review agent.
+				reviewPrompt := fmt.Sprintf("/pr-review %d", prNumber)
+				if err := launchAgent(cfg, repoRoot, reviewPrompt, stdin, stdout, stderr, cmd); err != nil {
+					logger.Printf("loop: review agent failed for PR #%d: %v", prNumber, err)
+					break
+				}
+
+				verdict := parseReviewVerdict(repoRoot)
+				logger.Printf("loop: review verdict for PR #%d: %s", prNumber, verdict)
+
+				if verdict == verdictApprove {
+					approved = true
+					break
+				}
+				if verdict == verdictBlock {
+					logger.Printf("loop: PR #%d blocked by review, skipping", prNumber)
+					break
+				}
+
+				// request_changes or unknown — launch fix agent.
+				if round >= cfg.MaxReviewRounds {
+					logger.Printf("loop: exhausted %d review rounds for PR #%d", cfg.MaxReviewRounds, prNumber)
+					break
+				}
+
+				logger.Printf("loop: launching fix agent for PR #%d (round %d)", prNumber, round)
+				fixPrompt := fmt.Sprintf("/address-pr-feedback %d --afk", prNumber)
+				if err := launchAgent(cfg, repoRoot, fixPrompt, stdin, stdout, stderr, cmd); err != nil {
+					logger.Printf("loop: fix agent failed for PR #%d: %v", prNumber, err)
+					break
+				}
+
+				// Push fixes that address-pr-feedback committed locally.
+				if _, pushErr := cmd.Run(repoRoot, "git", "push", "origin", branchName); pushErr != nil {
+					logger.Printf("loop: warning: git push failed for branch %s: %v", branchName, pushErr)
+				}
+			}
+
+			if approved {
+				if err := mergePR(repoRoot, prNumber, cmd); err != nil {
+					failed++
+					logger.Printf("loop: failed to merge PR #%d: %v", prNumber, err)
+				} else {
+					logger.Printf("loop: merged PR #%d", prNumber)
+					closeReason := fmt.Sprintf("Completed by autopilot loop — PR #%d merged (launcher=%s, elapsed=%s)", prNumber, cfg.Launcher, time.Since(startTime).Truncate(time.Second))
+					if _, err := cmd.Run(repoRoot, "bd", "close", full.ID, "--reason", closeReason, "--json"); err != nil {
+						logger.Printf("loop: warning: failed to close %s: %v", full.ID, err)
+					} else {
+						logger.Printf("loop: closed %s", full.ID)
+					}
+					completed++
+					logger.Printf("loop: %s completed in %s (completed=%d, failed=%d)", full.ID, time.Since(startTime).Truncate(time.Second), completed, failed)
+				}
+			} else {
+				failed++
+				logger.Printf("loop: %s not approved after review (completed=%d, failed=%d)", full.ID, completed, failed)
+			}
 		} else {
-			// Close the issue on success.
+			// No review — close on agent success.
 			reason := fmt.Sprintf("Completed by autopilot loop (launcher=%s, elapsed=%s)", cfg.Launcher, elapsed)
 			if _, err := cmd.Run(repoRoot, "bd", "close", full.ID, "--reason", reason, "--json"); err != nil {
 				logger.Printf("loop: warning: failed to close %s: %v", full.ID, err)
@@ -516,7 +604,7 @@ func runLoop(cfg loopConfig, stdin io.Reader, stdout io.Writer, stderr io.Writer
 			logger.Printf("loop: %s completed in %s (completed=%d, failed=%d)", full.ID, elapsed, completed, failed)
 		}
 
-		// Cooldown before next iteration.
+	cooldown:
 		if cfg.Cooldown > 0 {
 			logger.Printf("loop: cooling down %s before next task", cfg.Cooldown)
 			select {
@@ -530,6 +618,134 @@ func runLoop(cfg loopConfig, stdin io.Reader, stdout io.Writer, stderr io.Writer
 
 	logger.Printf("loop: done — %d completed, %d failed", completed, failed)
 	return nil
+}
+
+// launchAgent starts a short-lived agent session with the given prompt.
+func launchAgent(cfg loopConfig, repoRoot string, prompt string, stdin io.Reader, stdout io.Writer, stderr io.Writer, cmd runner) error {
+	agentCfg := config{
+		Launcher: cfg.Launcher,
+		Model:    cfg.Model,
+		Agent:    cfg.Agent,
+	}
+	args, err := buildLaunchArgs(agentCfg, repoRoot, prompt)
+	if err != nil {
+		return err
+	}
+	return cmd.Start(repoRoot, stdin, stdout, stderr, cfg.Launcher, args...)
+}
+
+// detectPR finds an open PR for the given head branch using gh.
+func detectPR(repoRoot string, branch string, cmd runner) (int, error) {
+	output, err := cmd.Run(repoRoot, "gh", "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "1")
+	if err != nil {
+		return 0, fmt.Errorf("gh pr list: %w", err)
+	}
+
+	var prs []struct {
+		Number int `json:"number"`
+	}
+	if err := json.Unmarshal(output, &prs); err != nil {
+		return 0, fmt.Errorf("parse PR list: %w", err)
+	}
+	if len(prs) == 0 {
+		return 0, fmt.Errorf("no open PR found for branch %s", branch)
+	}
+	return prs[0].Number, nil
+}
+
+// Review verdict constants.
+const (
+	verdictApprove        = "approve"
+	verdictRequestChanges = "request_changes"
+	verdictBlock          = "block"
+	verdictUnknown        = "unknown"
+)
+
+// parseReviewVerdict reads the latest pr-review report and extracts the verdict.
+// It scans .rp1/work/pr-reviews/ for the most recently modified .md file and
+// looks for structured verdict markers that /pr-review emits.
+func parseReviewVerdict(repoRoot string) string {
+	reviewDir := filepath.Join(repoRoot, ".rp1", "work", "pr-reviews")
+	entries, err := os.ReadDir(reviewDir)
+	if err != nil {
+		return verdictUnknown
+	}
+
+	// Find the most recently modified .md file.
+	var latestPath string
+	var latestMod time.Time
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if latestPath == "" || info.ModTime().After(latestMod) {
+			latestPath = filepath.Join(reviewDir, e.Name())
+			latestMod = info.ModTime()
+		}
+	}
+	if latestPath == "" {
+		return verdictUnknown
+	}
+
+	data, err := os.ReadFile(latestPath)
+	if err != nil {
+		return verdictUnknown
+	}
+
+	return extractVerdict(string(data))
+}
+
+// extractVerdict parses review content for verdict markers.
+// Exported for testing via the package-level function.
+func extractVerdict(content string) string {
+	lower := strings.ToLower(content)
+
+	// rp1 pr-review uses emoji markers and backtick-quoted verdicts.
+	// Check structured patterns first (most reliable).
+	verdictPatterns := []struct {
+		verdict  string
+		patterns []string
+	}{
+		{verdictApprove, []string{
+			"verdict: approve", "verdict: `approve`",
+			"judgment: approve", "judgment: `approve`",
+			"decision: approve", "decision: `approve`",
+			"\u2705 `approve`", "\u2705 approve",
+		}},
+		{verdictBlock, []string{
+			"verdict: block", "verdict: `block`",
+			"judgment: block", "judgment: `block`",
+			"decision: block", "decision: `block`",
+			"\U0001f6d1 `block`", "\U0001f6d1 block",
+		}},
+		{verdictRequestChanges, []string{
+			"verdict: request_changes", "verdict: `request_changes`",
+			"judgment: request_changes", "judgment: `request_changes`",
+			"decision: request_changes", "decision: `request_changes`",
+			"verdict: request changes", "judgment: request changes",
+			"\u26a0\ufe0f `request_changes`", "\u26a0\ufe0f request_changes",
+		}},
+	}
+
+	for _, vp := range verdictPatterns {
+		for _, pattern := range vp.patterns {
+			if strings.Contains(lower, pattern) {
+				return vp.verdict
+			}
+		}
+	}
+
+	return verdictUnknown
+}
+
+// mergePR merges an open PR using squash strategy.
+func mergePR(repoRoot string, prNumber int, cmd runner) error {
+	_, err := cmd.Run(repoRoot, "gh", "pr", "merge", fmt.Sprintf("%d", prNumber), "--squash", "--delete-branch")
+	return err
 }
 
 func buildLaunchArgs(cfg config, repoRoot string, prompt string) ([]string, error) {
@@ -707,9 +923,12 @@ func printIssues(out io.Writer, issues []issue) {
 	}
 }
 
-func buildRP1Prompt(repoRoot string, item issue) string {
+func buildRP1Prompt(repoRoot string, item issue, gitPR bool) string {
 	requirement := buildRequirementName(item)
 	description := buildRequirementDescription(repoRoot, item)
+	if gitPR {
+		return fmt.Sprintf(`/rp1-build %s %s --git-pr --afk`, quoteSlashArg(requirement), quoteSlashArg(description))
+	}
 	return fmt.Sprintf(`/rp1-build %s %s --afk`, quoteSlashArg(requirement), quoteSlashArg(description))
 }
 

@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.0] - 2026-03-11
+
+### Added
+- `--review` flag on `autopilot loop` for full PR review cycle
+- `--max-review-rounds` flag (default 3) to cap review/fix iterations
+- Autopilot-driven PR lifecycle: detect PR via `gh`, launch review agent (`/pr-review`), parse verdict from `.rp1/work/pr-reviews/`, launch fix agent (`/address-pr-feedback`), push fixes, merge via `gh pr merge --squash`, close beads issue
+- `extractVerdict` parser for rp1 pr-review report files (emoji and structured patterns)
+- `launchAgent`, `detectPR`, `mergePR` helper functions
+- `gh` binary validation when `--review` is enabled
+
+### Changed
+- `buildRP1Prompt` now accepts `gitPR` parameter — `--git-pr` is included only when `--review` is active
+- Without `--review`, loop behavior is unchanged (no PR, close on agent success)
+
 ## [0.2.0] - 2026-03-11
 
 ### Added
@@ -11,7 +25,7 @@
 - Automatic `bd close` on successful agent completion
 
 ### Changed
-- Removed `--git-pr` from generated `/rp1-build` prompts (agents commit to branch, no PR created)
+- Removed `--git-pr` from generated `/rp1-build` prompts without `--review`
 
 ## [0.1.1] - 2026-03-11
 

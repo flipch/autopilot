@@ -70,7 +70,7 @@ func TestBuildRP1PromptIncludesBeadsContext(t *testing.T) {
 		Description:        "The current web container runs the Vite development server instead of serving a production build.",
 		AcceptanceCriteria: "The web production container serves compiled assets only.",
 		Parent:             "jobber-t6m",
-	})
+	}, false)
 
 	checks := []string{
 		"/rp1-build",
@@ -84,6 +84,23 @@ func TestBuildRP1PromptIncludesBeadsContext(t *testing.T) {
 		if !strings.Contains(prompt, check) {
 			t.Fatalf("expected prompt to contain %q\nprompt: %s", check, prompt)
 		}
+	}
+	if strings.Contains(prompt, "--git-pr") {
+		t.Fatalf("expected no --git-pr without review flag, prompt: %s", prompt)
+	}
+}
+
+func TestBuildRP1PromptIncludesGitPRWhenReview(t *testing.T) {
+	prompt := buildRP1Prompt("/Users/felipeh/Development/jobber", issue{
+		ID:    "jobber-1",
+		Title: "Test issue",
+	}, true)
+
+	if !strings.Contains(prompt, "--git-pr") {
+		t.Fatalf("expected --git-pr in review mode, prompt: %s", prompt)
+	}
+	if !strings.Contains(prompt, "--afk") {
+		t.Fatalf("expected --afk in review mode, prompt: %s", prompt)
 	}
 }
 
@@ -460,7 +477,7 @@ func TestRunLoopContinuesOnLaunchFailure(t *testing.T) {
 		t.Fatalf("runLoop failed: %v", err)
 	}
 
-	if !strings.Contains(stderr.String(), "job-1 failed") {
+	if !strings.Contains(stderr.String(), "job-1 build failed") {
 		t.Fatalf("expected failure log for job-1, stderr: %s", stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "closed job-2") {
@@ -471,14 +488,195 @@ func TestRunLoopContinuesOnLaunchFailure(t *testing.T) {
 	}
 }
 
-// cycleReadyRunner wraps fakeRunner but cycles through different bd ready outputs
-// and optionally fails specific Start calls.
+func TestRunLoopWithReviewCycleApproves(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+
+	// Create a review verdict file that says approve.
+	reviewDir := filepath.Join(repo, ".rp1", "work", "pr-reviews")
+	if err := os.MkdirAll(reviewDir, 0o755); err != nil {
+		t.Fatalf("mkdir review dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(reviewDir, "review-001.md"), []byte("## Judgment\n\nVerdict: `approve`\n\nLooks good."), 0o644); err != nil {
+		t.Fatalf("write review: %v", err)
+	}
+
+	showJSON := `[{"id":"job-1","title":"Add feature","description":"Details","acceptance_criteria":"Done","priority":1,"issue_type":"task","created_at":"2026-03-10T10:00:00Z"}]`
+
+	cycleRunner := &cycleReadyRunner{
+		fakeRunner: &fakeRunner{
+			runOutputs: map[string][]byte{
+				commandKey("bd", "show", "job-1", "--json", "--long"):    []byte(showJSON),
+				commandKey("bd", "update", "job-1", "--claim", "--json"): []byte(`{"id":"job-1"}`),
+			},
+			lookups: map[string]error{},
+		},
+		readyOutputs: [][]byte{
+			[]byte(`[{"id":"job-1","title":"Add feature","priority":1,"issue_type":"task","created_at":"2026-03-10T10:00:00Z"}]`),
+			[]byte(`[]`),
+		},
+		// gh pr list returns PR #10, gh pr merge succeeds.
+		ghPRListOutput: []byte(`[{"number":10}]`),
+		ghPRMergeOK:    true,
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := runLoop(loopConfig{
+		RepoPath:        repo,
+		Launcher:        "opencode",
+		Model:           defaultModel,
+		Agent:           defaultAgent,
+		Cooldown:        0,
+		Review:          true,
+		MaxReviewRounds: 3,
+	}, strings.NewReader(""), &stdout, &stderr, cycleRunner); err != nil {
+		t.Fatalf("runLoop failed: %v\nstderr: %s", err, stderr.String())
+	}
+
+	log := stderr.String()
+	if !strings.Contains(log, "detected PR #10") {
+		t.Fatalf("expected PR detection log, stderr: %s", log)
+	}
+	if !strings.Contains(log, "review verdict for PR #10: approve") {
+		t.Fatalf("expected approve verdict log, stderr: %s", log)
+	}
+	if !strings.Contains(log, "merged PR #10") {
+		t.Fatalf("expected merge log, stderr: %s", log)
+	}
+	if !strings.Contains(log, "closed job-1") {
+		t.Fatalf("expected issue close log, stderr: %s", log)
+	}
+
+	// Should have 2 starts: build agent + review agent.
+	if len(cycleRunner.fakeRunner.started) != 2 {
+		t.Fatalf("expected 2 agent launches (build + review), got %d", len(cycleRunner.fakeRunner.started))
+	}
+}
+
+func TestRunLoopWithReviewFixCycle(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+
+	reviewDir := filepath.Join(repo, ".rp1", "work", "pr-reviews")
+	if err := os.MkdirAll(reviewDir, 0o755); err != nil {
+		t.Fatalf("mkdir review dir: %v", err)
+	}
+
+	showJSON := `[{"id":"job-1","title":"Fix bug","description":"Details","acceptance_criteria":"Done","priority":1,"issue_type":"task","created_at":"2026-03-10T10:00:00Z"}]`
+
+	// The review verdict file will be written/updated by the test cycle runner
+	// to simulate: round 1 = request_changes, round 2 = approve.
+	reviewFile := filepath.Join(reviewDir, "review-001.md")
+	reviewContents := []string{
+		"## Judgment\n\nVerdict: `request_changes`\n\nNeeds fixes.",
+		"## Judgment\n\nVerdict: `approve`\n\nAll good now.",
+	}
+
+	cycleRunner := &cycleReadyRunner{
+		fakeRunner: &fakeRunner{
+			runOutputs: map[string][]byte{
+				commandKey("bd", "show", "job-1", "--json", "--long"):    []byte(showJSON),
+				commandKey("bd", "update", "job-1", "--claim", "--json"): []byte(`{"id":"job-1"}`),
+			},
+			lookups: map[string]error{},
+		},
+		readyOutputs: [][]byte{
+			[]byte(`[{"id":"job-1","title":"Fix bug","priority":1,"issue_type":"task","created_at":"2026-03-10T10:00:00Z"}]`),
+			[]byte(`[]`),
+		},
+		ghPRListOutput: []byte(`[{"number":5}]`),
+		ghPRMergeOK:    true,
+		// Write different review verdicts on each review agent launch.
+		onStart: func(idx int, args []string) {
+			// Review agent launches are idx 1 (first review) and idx 3 (second review).
+			// Build=0, Review1=1, Fix=2, Review2=3.
+			prompt := strings.Join(args, " ")
+			if strings.Contains(prompt, "/pr-review") {
+				reviewIdx := 0
+				if idx >= 3 {
+					reviewIdx = 1
+				}
+				if reviewIdx < len(reviewContents) {
+					os.WriteFile(reviewFile, []byte(reviewContents[reviewIdx]), 0o644)
+				}
+			}
+		},
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := runLoop(loopConfig{
+		RepoPath:        repo,
+		Launcher:        "opencode",
+		Model:           defaultModel,
+		Agent:           defaultAgent,
+		Cooldown:        0,
+		Review:          true,
+		MaxReviewRounds: 3,
+	}, strings.NewReader(""), &stdout, &stderr, cycleRunner); err != nil {
+		t.Fatalf("runLoop failed: %v\nstderr: %s", err, stderr.String())
+	}
+
+	log := stderr.String()
+	if !strings.Contains(log, "verdict for PR #5: request_changes") {
+		t.Fatalf("expected request_changes verdict, stderr: %s", log)
+	}
+	if !strings.Contains(log, "launching fix agent for PR #5") {
+		t.Fatalf("expected fix agent launch, stderr: %s", log)
+	}
+	if !strings.Contains(log, "verdict for PR #5: approve") {
+		t.Fatalf("expected approve after fix, stderr: %s", log)
+	}
+	if !strings.Contains(log, "merged PR #5") {
+		t.Fatalf("expected merge, stderr: %s", log)
+	}
+
+	// 4 launches: build + review1 + fix + review2.
+	if len(cycleRunner.fakeRunner.started) != 4 {
+		t.Fatalf("expected 4 agent launches, got %d", len(cycleRunner.fakeRunner.started))
+	}
+}
+
+func TestExtractVerdict(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{"approve with backtick", "## Judgment\nVerdict: `approve`", verdictApprove},
+		{"approve plain", "Verdict: approve\nLooks good", verdictApprove},
+		{"approve emoji", "\u2705 `approve` — Ready to merge", verdictApprove},
+		{"request_changes", "Verdict: `request_changes`\nNeeds work", verdictRequestChanges},
+		{"request_changes emoji", "\u26a0\ufe0f `request_changes` — Issues found", verdictRequestChanges},
+		{"block", "Verdict: `block`\nCritical issues", verdictBlock},
+		{"block emoji", "\U0001f6d1 `block` — Cannot merge", verdictBlock},
+		{"unknown content", "This PR looks interesting", verdictUnknown},
+		{"empty", "", verdictUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractVerdict(tt.content)
+			if got != tt.want {
+				t.Fatalf("extractVerdict() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// cycleReadyRunner wraps fakeRunner but cycles through different bd ready outputs,
+// handles gh commands for the review cycle, and optionally fails specific Start calls.
 type cycleReadyRunner struct {
 	*fakeRunner
-	readyOutputs [][]byte
-	readyIndex   int
-	startErrors  map[int]error
-	startIndex   int
+	readyOutputs   [][]byte
+	readyIndex     int
+	startErrors    map[int]error
+	startIndex     int
+	ghPRListOutput []byte
+	ghPRMergeOK    bool
+	onStart        func(idx int, args []string)
 }
 
 func (c *cycleReadyRunner) Run(dir string, name string, args ...string) ([]byte, error) {
@@ -495,10 +693,34 @@ func (c *cycleReadyRunner) Run(dir string, name string, args ...string) ([]byte,
 		return c.readyOutputs[idx], nil
 	}
 
-	// Match bd close commands dynamically (any reason string).
+	// Handle bd close commands dynamically (any reason string).
 	if name == "bd" && len(args) >= 1 && args[0] == "close" {
 		c.fakeRunner.runs = append(c.fakeRunner.runs, invocation{dir: dir, name: name, args: append([]string{}, args...)})
 		return []byte(`{}`), nil
+	}
+
+	// Handle gh pr list.
+	if name == "gh" && len(args) >= 2 && args[0] == "pr" && args[1] == "list" {
+		c.fakeRunner.runs = append(c.fakeRunner.runs, invocation{dir: dir, name: name, args: append([]string{}, args...)})
+		if c.ghPRListOutput != nil {
+			return c.ghPRListOutput, nil
+		}
+		return []byte(`[]`), nil
+	}
+
+	// Handle gh pr merge.
+	if name == "gh" && len(args) >= 2 && args[0] == "pr" && args[1] == "merge" {
+		c.fakeRunner.runs = append(c.fakeRunner.runs, invocation{dir: dir, name: name, args: append([]string{}, args...)})
+		if c.ghPRMergeOK {
+			return []byte(`{}`), nil
+		}
+		return nil, errors.New("merge failed")
+	}
+
+	// Handle git push.
+	if name == "git" && len(args) >= 1 && args[0] == "push" {
+		c.fakeRunner.runs = append(c.fakeRunner.runs, invocation{dir: dir, name: name, args: append([]string{}, args...)})
+		return []byte{}, nil
 	}
 
 	return c.fakeRunner.Run(dir, name, args...)
@@ -508,6 +730,9 @@ func (c *cycleReadyRunner) Start(dir string, stdin io.Reader, stdout io.Writer, 
 	idx := c.startIndex
 	c.startIndex++
 	c.fakeRunner.started = append(c.fakeRunner.started, invocation{dir: dir, name: name, args: append([]string{}, args...)})
+	if c.onStart != nil {
+		c.onStart(idx, args)
+	}
 	if c.startErrors != nil {
 		if err := c.startErrors[idx]; err != nil {
 			return err

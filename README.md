@@ -82,6 +82,26 @@ The loop:
 6. Repeats until no ready issues remain (or `--max-tasks` reached)
 7. Handles SIGINT/SIGTERM gracefully
 
+### Loop with PR review
+
+Add `--review` to enable the full PR lifecycle. Autopilot orchestrates everything — agents are only invoked for AI-heavy work (review analysis and code fixes):
+
+```bash
+autopilot loop --repo ~/Development/jobber --launcher claude --review
+autopilot loop --repo ~/Development/jobber --review --max-review-rounds 5
+```
+
+With `--review` enabled, the loop becomes:
+1. Build agent runs with `--git-pr --afk` → creates PR
+2. **Autopilot** detects the PR via `gh pr list --head <branch>`
+3. **Autopilot** launches a review agent with `/pr-review <pr-number>`
+4. **Autopilot** parses the verdict from `.rp1/work/pr-reviews/`
+5. If approved → **autopilot** merges via `gh pr merge --squash` → closes beads issue
+6. If changes requested → **autopilot** launches fix agent with `/address-pr-feedback <pr> --afk` → pushes fixes → re-reviews
+7. If blocked or max rounds reached → logs failure, moves to next issue
+
+Requires `gh` CLI authenticated and in PATH.
+
 ## Defaults
 
 - launcher: `opencode`
