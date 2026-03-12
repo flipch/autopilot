@@ -711,8 +711,14 @@ func runWorker(cfg loopConfig, repoRoot string, stopCh <-chan struct{}, stdin io
 					break
 				}
 
-				if _, pushErr := cmd.Run(repoRoot, "git", "push", "origin", branchName); pushErr != nil {
-					logger.Printf("warning: git push failed for branch %s: %v", branchName, pushErr)
+				// Push the fix — get the actual branch name from the PR since
+				// rp1/claude may prefix it differently than our slug.
+				pushBranch := branchName
+				if prBranch, err := getPRBranch(repoRoot, prNumber, cmd); err == nil {
+					pushBranch = prBranch
+				}
+				if _, pushErr := cmd.Run(repoRoot, "git", "push", "origin", pushBranch); pushErr != nil {
+					logger.Printf("warning: git push failed for branch %s: %v", pushBranch, pushErr)
 				}
 			}
 
@@ -1027,6 +1033,19 @@ func extractVerdict(content string) string {
 	}
 
 	return verdictUnknown
+}
+
+// getPRBranch returns the head branch name of a PR.
+func getPRBranch(repoRoot string, prNumber int, cmd runner) (string, error) {
+	output, err := cmd.Run(repoRoot, "gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "headRefName", "-q", ".headRefName")
+	if err != nil {
+		return "", err
+	}
+	branch := strings.TrimSpace(string(output))
+	if branch == "" {
+		return "", fmt.Errorf("empty branch name for PR #%d", prNumber)
+	}
+	return branch, nil
 }
 
 // mergePR merges an open PR using squash strategy.

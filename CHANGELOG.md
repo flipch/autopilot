@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.9] - 2026-03-12
+
+### Fixed
+- Post-fix push now resolves the actual PR branch name from GitHub instead of using the slug (which doesn't match rp1/Claude prefixed branch names)
+- `/address-pr-feedback` commits locally but never pushes — autopilot now reliably pushes the correct branch after fixes
+
 ## [0.7.8] - 2026-03-12
 
 ### Fixed
