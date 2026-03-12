@@ -102,6 +102,19 @@ With `--review` enabled, the loop becomes:
 
 Requires `gh` CLI authenticated and in PATH.
 
+### Logging
+
+By default, loop logs go to stderr (mixed with agent output). Use `--log-file` for clean, dedicated logs:
+
+```bash
+autopilot loop --repo ~/Development/jobber --launcher claude --log-file /tmp/autopilot.log
+
+# Monitor from another terminal:
+tail -f /tmp/autopilot.log
+```
+
+Logs are written to both stderr and the file, with timestamps and structured messages for each step (claim, launch, review, merge, close).
+
 ## Defaults
 
 - launcher: `opencode`

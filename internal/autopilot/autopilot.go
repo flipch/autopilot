@@ -94,7 +94,25 @@ func (execRunner) Start(dir string, stdin io.Reader, stdout io.Writer, stderr io
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	// Strip env vars that prevent nested Claude sessions.
+	cmd.Env = filteredEnv("CLAUDECODE", "CLAUDE_CODE")
 	return cmd.Run()
+}
+
+// filteredEnv returns os.Environ() with the named variables removed.
+func filteredEnv(names ...string) []string {
+	skip := make(map[string]bool, len(names))
+	for _, n := range names {
+		skip[n] = true
+	}
+	var env []string
+	for _, e := range os.Environ() {
+		key := e[:strings.IndexByte(e, '=')]
+		if !skip[key] {
+			env = append(env, e)
+		}
+	}
+	return env
 }
 
 func (execRunner) LookPath(file string) (string, error) {
@@ -106,15 +124,16 @@ func Run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) err
 }
 
 type loopConfig struct {
-	RepoPath       string
-	Launcher       string
-	Model          string
-	Agent          string
-	Cooldown       time.Duration
-	MaxTasks       int
-	Review         bool
+	RepoPath        string
+	Launcher        string
+	Model           string
+	Agent           string
+	Cooldown        time.Duration
+	MaxTasks        int
+	Review          bool
 	MaxReviewRounds int
-	Config         string
+	LogFile         string
+	Config          string
 }
 
 func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer, cmd runner) error {
@@ -221,6 +240,7 @@ func parseLoopArgs(args []string) (loopConfig, error) {
 	fs.IntVar(&cfg.MaxTasks, "max-tasks", 0, "maximum tasks to process (0 = unlimited)")
 	fs.BoolVar(&cfg.Review, "review", false, "enable PR review cycle (creates PR, reviews, fixes feedback, merges)")
 	fs.IntVar(&cfg.MaxReviewRounds, "max-review-rounds", 3, "maximum review/fix iterations per PR")
+	fs.StringVar(&cfg.LogFile, "log-file", "", "write structured logs to file (in addition to stderr)")
 	fs.StringVar(&cfg.Config, "config", defaultCfgPath, "config file path")
 
 	if err := fs.Parse(args); err != nil {
@@ -419,7 +439,20 @@ func runNext(cfg config, stdin io.Reader, stdout io.Writer, stderr io.Writer, cm
 }
 
 func runLoop(cfg loopConfig, stdin io.Reader, stdout io.Writer, stderr io.Writer, cmd runner) error {
-	logger := log.New(stderr, "", log.Ldate|log.Ltime)
+	logWriter := io.Writer(stderr)
+	if cfg.LogFile != "" {
+		expanded, err := expandHome(cfg.LogFile)
+		if err != nil {
+			return fmt.Errorf("expand log file path: %w", err)
+		}
+		f, err := os.OpenFile(expanded, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return fmt.Errorf("open log file: %w", err)
+		}
+		defer f.Close()
+		logWriter = io.MultiWriter(stderr, f)
+	}
+	logger := log.New(logWriter, "", log.Ldate|log.Ltime)
 
 	if _, err := cmd.LookPath("bd"); err != nil {
 		return errors.New("bd not found in PATH")

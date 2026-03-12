@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.0] - 2026-03-12
+
+### Added
+- `--log-file` flag on `loop` command — writes structured logs to a dedicated file in addition to stderr, so an orchestrator can `tail -f` progress without parsing agent noise
+- Automatic `CLAUDECODE` and `CLAUDE_CODE` env var stripping when launching agent subprocesses — fixes nested session errors when autopilot is invoked from inside a Claude Code session
+
+### Fixed
+- Agents launched by autopilot no longer fail with "already inside a Claude session" when autopilot itself runs inside Claude Code
+
 ## [0.3.1] - 2026-03-11
 
 ### Fixed

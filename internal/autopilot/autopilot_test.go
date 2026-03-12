@@ -643,6 +643,71 @@ func TestRunLoopWithReviewFixCycle(t *testing.T) {
 	}
 }
 
+func TestFilteredEnvRemovesClaudeVars(t *testing.T) {
+	// Set test vars.
+	t.Setenv("CLAUDECODE", "1")
+	t.Setenv("CLAUDE_CODE", "1")
+	t.Setenv("SOME_OTHER_VAR", "keep")
+
+	env := filteredEnv("CLAUDECODE", "CLAUDE_CODE")
+	for _, e := range env {
+		key := e[:strings.IndexByte(e, '=')]
+		if key == "CLAUDECODE" || key == "CLAUDE_CODE" {
+			t.Fatalf("expected %s to be filtered out, but found it", key)
+		}
+	}
+	found := false
+	for _, e := range env {
+		if strings.HasPrefix(e, "SOME_OTHER_VAR=") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected SOME_OTHER_VAR to be preserved")
+	}
+}
+
+func TestRunLoopWritesToLogFile(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+
+	logFile := filepath.Join(t.TempDir(), "autopilot.log")
+
+	cycleRunner := &cycleReadyRunner{
+		fakeRunner: &fakeRunner{
+			runOutputs: map[string][]byte{},
+			lookups:    map[string]error{},
+		},
+		readyOutputs: [][]byte{[]byte(`[]`)},
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := runLoop(loopConfig{
+		RepoPath: repo,
+		Launcher: "opencode",
+		Model:    defaultModel,
+		Agent:    defaultAgent,
+		Cooldown: 0,
+		LogFile:  logFile,
+	}, strings.NewReader(""), &stdout, &stderr, cycleRunner); err != nil {
+		t.Fatalf("runLoop failed: %v", err)
+	}
+
+	content, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+	if !strings.Contains(string(content), "loop: starting for") {
+		t.Fatalf("expected log file to contain startup message, got: %s", string(content))
+	}
+	// Both stderr and file should have the same content.
+	if !strings.Contains(stderr.String(), "loop: starting for") {
+		t.Fatalf("expected stderr to also have logs, got: %s", stderr.String())
+	}
+}
+
 func TestExtractVerdict(t *testing.T) {
 	tests := []struct {
 		name    string
