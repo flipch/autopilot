@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.0] - 2026-03-12
+
+### Added
+- `--zellij` flag on `loop` command — spawns each worker in its own zellij pane for full visibility and interaction
+- If already in a zellij session: adds panes via `zellij action new-pane`
+- If not: generates a KDL layout and launches a new zellij session (`autopilot-<repo>`)
+- Each pane runs a single-worker `autopilot loop --parallel 1` with full terminal I/O
+- CLAUDECODE env vars stripped from zellij session environment
+
 ## [0.5.0] - 2026-03-12
 
 ### Added

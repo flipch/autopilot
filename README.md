@@ -121,6 +121,20 @@ Each worker independently picks issues, claims them (atomic via `bd --claim`), a
 
 With multiple workers, agent stdout/stderr is discarded — use `--log-file` to monitor progress.
 
+### Zellij mode
+
+Add `--zellij` to get each worker in its own visible, interactive pane:
+
+```bash
+# Auto-detect workers, each in a zellij pane
+autopilot loop --repo ~/Development/jobber --launcher claude --zellij
+
+# 3 workers in zellij with review enabled
+autopilot loop --repo ~/Development/jobber --launcher claude --zellij --parallel 3 --review
+```
+
+If you're already in a zellij session, panes are added to it. Otherwise, a new `autopilot-<repo>` session is created. Each pane runs a single-worker loop with full terminal I/O — you can switch panes to watch any agent, or type into a session to intervene.
+
 ### Logging
 
 By default, loop logs go to stderr (mixed with agent output). Use `--log-file` for clean, dedicated logs:
