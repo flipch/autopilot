@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.7.8] - 2026-03-12
+
+### Fixed
+- Filter out epic-type issues from ready list — workers only pick leaf tasks, not parent tracking epics
+
 ## [0.7.7] - 2026-03-12
 
 ### Fixed

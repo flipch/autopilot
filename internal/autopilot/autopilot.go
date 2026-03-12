@@ -1089,9 +1089,18 @@ func loadReadyIssues(repoRoot string, cmd runner) ([]issue, error) {
 		return nil, err
 	}
 
-	var issues []issue
-	if err := json.Unmarshal(output, &issues); err != nil {
+	var all []issue
+	if err := json.Unmarshal(output, &all); err != nil {
 		return nil, fmt.Errorf("parse bd ready output: %w", err)
+	}
+
+	// Filter out epics — they're parent trackers, not buildable tasks.
+	issues := make([]issue, 0, len(all))
+	for _, item := range all {
+		if strings.EqualFold(item.IssueType, "epic") {
+			continue
+		}
+		issues = append(issues, item)
 	}
 
 	sortIssues(issues)
