@@ -3,10 +3,12 @@ package autopilot
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -25,6 +27,10 @@ type invocation struct {
 }
 
 func (f *fakeRunner) Run(dir string, name string, args ...string) ([]byte, error) {
+	return f.runLocked(dir, name, args...)
+}
+
+func (f *fakeRunner) runLocked(dir string, name string, args ...string) ([]byte, error) {
 	call := invocation{dir: dir, name: name, args: append([]string{}, args...)}
 	f.runs = append(f.runs, call)
 	key := commandKey(name, args...)
@@ -379,6 +385,7 @@ func TestRunLoopProcessesIssuesUntilEmpty(t *testing.T) {
 		Model:    defaultModel,
 		Agent:    defaultAgent,
 		Cooldown: 0,
+		Parallel: 1,
 	}, strings.NewReader(""), &stdout, &stderr, cycleRunner); err != nil {
 		t.Fatalf("runLoop failed: %v\nstderr: %s", err, stderr.String())
 	}
@@ -429,6 +436,7 @@ func TestRunLoopRespectsMaxTasks(t *testing.T) {
 		Model:    defaultModel,
 		Agent:    defaultAgent,
 		Cooldown: 0,
+		Parallel: 1,
 		MaxTasks: 1,
 	}, strings.NewReader(""), &stdout, &stderr, cycleRunner); err != nil {
 		t.Fatalf("runLoop failed: %v", err)
@@ -476,6 +484,7 @@ func TestRunLoopContinuesOnLaunchFailure(t *testing.T) {
 		Model:    defaultModel,
 		Agent:    defaultAgent,
 		Cooldown: 0,
+		Parallel: 1,
 	}, strings.NewReader(""), &stdout, &stderr, cycleRunner); err != nil {
 		t.Fatalf("runLoop failed: %v", err)
 	}
@@ -532,6 +541,7 @@ func TestRunLoopWithReviewCycleApproves(t *testing.T) {
 		Model:           defaultModel,
 		Agent:           defaultAgent,
 		Cooldown:        0,
+		Parallel:        1,
 		Review:          true,
 		MaxReviewRounds: 3,
 	}, strings.NewReader(""), &stdout, &stderr, cycleRunner); err != nil {
@@ -617,6 +627,7 @@ func TestRunLoopWithReviewFixCycle(t *testing.T) {
 		Model:           defaultModel,
 		Agent:           defaultAgent,
 		Cooldown:        0,
+		Parallel:        1,
 		Review:          true,
 		MaxReviewRounds: 3,
 	}, strings.NewReader(""), &stdout, &stderr, cycleRunner); err != nil {
@@ -640,6 +651,109 @@ func TestRunLoopWithReviewFixCycle(t *testing.T) {
 	// 4 launches: build + review1 + fix + review2.
 	if len(cycleRunner.fakeRunner.started) != 4 {
 		t.Fatalf("expected 4 agent launches, got %d", len(cycleRunner.fakeRunner.started))
+	}
+}
+
+func TestRunLoopParallelStartsMultipleWorkers(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+
+	showJSON := `[{"id":"job-1","title":"Task 1","description":"D","acceptance_criteria":"Done","priority":1,"issue_type":"task","created_at":"2026-03-10T10:00:00Z"}]`
+
+	// Workers get one issue then empty. With parallel=2, both workers start but
+	// only one gets the issue (the other sees empty immediately).
+	cycleRunner := &cycleReadyRunner{
+		fakeRunner: &fakeRunner{
+			runOutputs: map[string][]byte{
+				commandKey("bd", "show", "job-1", "--json", "--long"):    []byte(showJSON),
+				commandKey("bd", "update", "job-1", "--claim", "--json"): []byte(`{"id":"job-1"}`),
+			},
+			lookups: map[string]error{},
+		},
+		readyOutputs: [][]byte{
+			[]byte(`[{"id":"job-1","title":"Task 1","priority":1,"issue_type":"task","created_at":"2026-03-10T10:00:00Z"}]`),
+			[]byte(`[]`),
+			[]byte(`[]`),
+			[]byte(`[]`),
+		},
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := runLoop(loopConfig{
+		RepoPath: repo,
+		Launcher: "opencode",
+		Model:    defaultModel,
+		Agent:    defaultAgent,
+		Cooldown: 0,
+		Parallel: 2,
+	}, strings.NewReader(""), &stdout, &stderr, cycleRunner); err != nil {
+		t.Fatalf("runLoop failed: %v\nstderr: %s", err, stderr.String())
+	}
+
+	log := stderr.String()
+	if !strings.Contains(log, "starting 2 worker") {
+		t.Fatalf("expected 2 workers in startup log, stderr: %s", log)
+	}
+	if !strings.Contains(log, "[w1]") || !strings.Contains(log, "[w2]") {
+		t.Fatalf("expected worker prefixes [w1] and [w2], stderr: %s", log)
+	}
+	// At least 1 completed (the one that got the issue), total should be logged.
+	if !strings.Contains(log, "done") {
+		t.Fatalf("expected done summary, stderr: %s", log)
+	}
+}
+
+func TestRunLoopAutoDetectsCapsAtMaxParallel(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+
+	// 10 ready issues but should cap at maxParallel (5).
+	var issues []string
+	for i := 1; i <= 10; i++ {
+		issues = append(issues, fmt.Sprintf(`{"id":"job-%d","title":"Task %d","priority":2,"issue_type":"task","created_at":"2026-03-10T10:00:00Z"}`, i, i))
+	}
+	readyJSON := "[" + strings.Join(issues, ",") + "]"
+
+	// All we need is for auto-detect to see the issues and then workers find empty.
+	outputs := map[string][]byte{}
+	for i := 1; i <= 10; i++ {
+		id := fmt.Sprintf("job-%d", i)
+		showJSON := fmt.Sprintf(`[{"id":"%s","title":"Task %d","description":"D","acceptance_criteria":"Done","priority":2,"issue_type":"task","created_at":"2026-03-10T10:00:00Z"}]`, id, i)
+		outputs[commandKey("bd", "show", id, "--json", "--long")] = []byte(showJSON)
+		outputs[commandKey("bd", "update", id, "--claim", "--json")] = []byte(fmt.Sprintf(`{"id":"%s"}`, id))
+	}
+
+	cycleRunner := &cycleReadyRunner{
+		fakeRunner: &fakeRunner{
+			runOutputs: outputs,
+			lookups:    map[string]error{},
+		},
+		readyOutputs: [][]byte{
+			[]byte(readyJSON), // auto-detect
+			[]byte(`[]`), []byte(`[]`), []byte(`[]`), []byte(`[]`), []byte(`[]`), // workers find empty
+		},
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := runLoop(loopConfig{
+		RepoPath: repo,
+		Launcher: "opencode",
+		Model:    defaultModel,
+		Agent:    defaultAgent,
+		Cooldown: 0,
+		Parallel: 0, // auto-detect
+	}, strings.NewReader(""), &stdout, &stderr, cycleRunner); err != nil {
+		t.Fatalf("runLoop failed: %v\nstderr: %s", err, stderr.String())
+	}
+
+	log := stderr.String()
+	if !strings.Contains(log, "starting 5 worker") {
+		t.Fatalf("expected auto-detect to cap at 5 workers, stderr: %s", log)
 	}
 }
 
@@ -690,6 +804,7 @@ func TestRunLoopWritesToLogFile(t *testing.T) {
 		Model:    defaultModel,
 		Agent:    defaultAgent,
 		Cooldown: 0,
+		Parallel: 1,
 		LogFile:  logFile,
 	}, strings.NewReader(""), &stdout, &stderr, cycleRunner); err != nil {
 		t.Fatalf("runLoop failed: %v", err)
@@ -699,11 +814,11 @@ func TestRunLoopWritesToLogFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read log file: %v", err)
 	}
-	if !strings.Contains(string(content), "loop: starting for") {
+	if !strings.Contains(string(content), "starting 1 worker") {
 		t.Fatalf("expected log file to contain startup message, got: %s", string(content))
 	}
 	// Both stderr and file should have the same content.
-	if !strings.Contains(stderr.String(), "loop: starting for") {
+	if !strings.Contains(stderr.String(), "starting 1 worker") {
 		t.Fatalf("expected stderr to also have logs, got: %s", stderr.String())
 	}
 }
@@ -736,8 +851,10 @@ func TestExtractVerdict(t *testing.T) {
 
 // cycleReadyRunner wraps fakeRunner but cycles through different bd ready outputs,
 // handles gh commands for the review cycle, and optionally fails specific Start calls.
+// All methods are thread-safe for parallel worker tests.
 type cycleReadyRunner struct {
 	*fakeRunner
+	mu             sync.Mutex
 	readyOutputs   [][]byte
 	readyIndex     int
 	startErrors    map[int]error
@@ -748,6 +865,9 @@ type cycleReadyRunner struct {
 }
 
 func (c *cycleReadyRunner) Run(dir string, name string, args ...string) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	key := commandKey(name, args...)
 	readyKey := commandKey("bd", "ready", "--json")
 
@@ -791,22 +911,25 @@ func (c *cycleReadyRunner) Run(dir string, name string, args ...string) ([]byte,
 		return []byte{}, nil
 	}
 
-	return c.fakeRunner.Run(dir, name, args...)
+	return c.fakeRunner.runLocked(dir, name, args...)
 }
 
 func (c *cycleReadyRunner) Start(dir string, stdin io.Reader, stdout io.Writer, stderr io.Writer, name string, args ...string) error {
+	c.mu.Lock()
 	idx := c.startIndex
 	c.startIndex++
 	c.fakeRunner.started = append(c.fakeRunner.started, invocation{dir: dir, name: name, args: append([]string{}, args...)})
-	if c.onStart != nil {
-		c.onStart(idx, args)
-	}
+	onStart := c.onStart
+	var startErr error
 	if c.startErrors != nil {
-		if err := c.startErrors[idx]; err != nil {
-			return err
-		}
+		startErr = c.startErrors[idx]
 	}
-	return nil
+	c.mu.Unlock()
+
+	if onStart != nil {
+		onStart(idx, args)
+	}
+	return startErr
 }
 
 func (c *cycleReadyRunner) LookPath(file string) (string, error) {

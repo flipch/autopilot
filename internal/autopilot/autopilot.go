@@ -17,6 +17,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -26,6 +28,7 @@ const (
 	defaultModel      = "anthropic/claude-opus-4-6"
 	defaultClaudeMode = "opus"
 	defaultAgent      = "opencoder"
+	maxParallel       = 5
 )
 
 var errUsage = errors.New("usage")
@@ -130,6 +133,7 @@ type loopConfig struct {
 	Agent           string
 	Cooldown        time.Duration
 	MaxTasks        int
+	Parallel        int
 	Review          bool
 	MaxReviewRounds int
 	LogFile         string
@@ -238,6 +242,7 @@ func parseLoopArgs(args []string) (loopConfig, error) {
 	fs.StringVar(&cfg.Agent, "agent", defaultAgent, "agent id (opencode only)")
 	fs.DurationVar(&cfg.Cooldown, "cooldown", 10*time.Second, "pause between tasks")
 	fs.IntVar(&cfg.MaxTasks, "max-tasks", 0, "maximum tasks to process (0 = unlimited)")
+	fs.IntVar(&cfg.Parallel, "parallel", 0, "number of parallel workers (0 = auto-detect from ready issues, max 5)")
 	fs.BoolVar(&cfg.Review, "review", false, "enable PR review cycle (creates PR, reviews, fixes feedback, merges)")
 	fs.IntVar(&cfg.MaxReviewRounds, "max-review-rounds", 3, "maximum review/fix iterations per PR")
 	fs.StringVar(&cfg.LogFile, "log-file", "", "write structured logs to file (in addition to stderr)")
@@ -471,63 +476,113 @@ func runLoop(cfg loopConfig, stdin io.Reader, stdout io.Writer, stderr io.Writer
 		return err
 	}
 
-	repoName := filepath.Base(repoRoot)
-	if cfg.Review {
-		logger.Printf("loop: starting for %s (launcher=%s, review=on, max-rounds=%d, cooldown=%s)", repoName, cfg.Launcher, cfg.MaxReviewRounds, cfg.Cooldown)
-	} else {
-		logger.Printf("loop: starting for %s (launcher=%s, cooldown=%s)", repoName, cfg.Launcher, cfg.Cooldown)
+	// Determine worker count.
+	workerCount := cfg.Parallel
+	if workerCount == 0 {
+		ready, err := loadReadyIssues(repoRoot, cmd)
+		if err != nil {
+			return err
+		}
+		workerCount = len(ready)
+		if workerCount > maxParallel {
+			workerCount = maxParallel
+		}
+		if workerCount == 0 {
+			logger.Printf("loop: no ready issues found")
+			return nil
+		}
 	}
 
-	// Handle graceful shutdown.
+	repoName := filepath.Base(repoRoot)
+	logger.Printf("loop: starting %d worker(s) for %s (launcher=%s, review=%t, cooldown=%s)", workerCount, repoName, cfg.Launcher, cfg.Review, cfg.Cooldown)
+
+	// Handle graceful shutdown — closing stopCh broadcasts to all workers.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
+	stopCh := make(chan struct{})
+	go func() {
+		sig := <-sigCh
+		logger.Printf("loop: received %s, signaling all workers to stop", sig)
+		close(stopCh)
+	}()
+
+	var completed, failed int64
+
+	if workerCount == 1 {
+		// Single worker — current behavior with inherited I/O.
+		wLogger := log.New(logWriter, "", log.Ldate|log.Ltime)
+		c, f := runWorker(cfg, repoRoot, stopCh, stdin, stdout, stderr, cmd, wLogger)
+		completed, failed = int64(c), int64(f)
+	} else {
+		// Parallel workers — agent output goes to /dev/null, autopilot log is source of truth.
+		var wg sync.WaitGroup
+		for i := 1; i <= workerCount; i++ {
+			wg.Add(1)
+			workerID := i
+			go func() {
+				defer wg.Done()
+				wLogger := log.New(logWriter, fmt.Sprintf("[w%d] ", workerID), log.Ldate|log.Ltime)
+				c, f := runWorker(cfg, repoRoot, stopCh, strings.NewReader(""), io.Discard, io.Discard, cmd, wLogger)
+				atomic.AddInt64(&completed, int64(c))
+				atomic.AddInt64(&failed, int64(f))
+			}()
+		}
+		wg.Wait()
+	}
+
+	logger.Printf("loop: done — %d completed, %d failed", completed, failed)
+	return nil
+}
+
+// runWorker processes issues in a loop until no work remains or stop is signaled.
+// Returns counts of completed and failed issues.
+func runWorker(cfg loopConfig, repoRoot string, stopCh <-chan struct{}, stdin io.Reader, stdout io.Writer, stderr io.Writer, cmd runner, logger *log.Logger) (int, int) {
 	completed := 0
 	failed := 0
 
 	for iteration := 1; ; iteration++ {
-		// Check for shutdown signal before starting next task.
+		// Check for stop signal.
 		select {
-		case sig := <-sigCh:
-			logger.Printf("loop: received %s, stopping after %d completed, %d failed", sig, completed, failed)
-			return nil
+		case <-stopCh:
+			logger.Printf("stopping after %d completed, %d failed", completed, failed)
+			return completed, failed
 		default:
 		}
 
 		if cfg.MaxTasks > 0 && completed >= cfg.MaxTasks {
-			logger.Printf("loop: reached max-tasks limit (%d), stopping", cfg.MaxTasks)
+			logger.Printf("reached max-tasks limit (%d), stopping", cfg.MaxTasks)
 			break
 		}
 
-		logger.Printf("loop: iteration %d — checking for ready issues", iteration)
+		logger.Printf("iteration %d — checking for ready issues", iteration)
 
 		ready, err := loadReadyIssues(repoRoot, cmd)
 		if err != nil {
-			logger.Printf("loop: error loading ready issues: %v", err)
-			return err
+			logger.Printf("error loading ready issues: %v", err)
+			break
 		}
 		if len(ready) == 0 {
-			logger.Printf("loop: no ready issues remaining, stopping after %d completed, %d failed", completed, failed)
+			logger.Printf("no ready issues remaining (completed=%d, failed=%d)", completed, failed)
 			break
 		}
 
 		selected := ready[0]
-		logger.Printf("loop: selected %s — %s (priority=%d, type=%s)", selected.ID, selected.Title, selected.Priority, selected.IssueType)
+		logger.Printf("selected %s — %s (priority=%d, type=%s)", selected.ID, selected.Title, selected.Priority, selected.IssueType)
 
-		// Load full issue details.
 		full, err := loadIssue(repoRoot, selected.ID, cmd)
 		if err != nil {
-			logger.Printf("loop: error loading issue %s: %v", selected.ID, err)
-			return err
+			logger.Printf("error loading issue %s: %v", selected.ID, err)
+			break
 		}
 
-		// Claim.
+		// Claim — may fail if another worker got it first.
 		if _, err := cmd.Run(repoRoot, "bd", "update", full.ID, "--claim", "--json"); err != nil {
-			logger.Printf("loop: error claiming %s: %v", full.ID, err)
-			return err
+			logger.Printf("claim failed for %s (likely taken by another worker), retrying", full.ID)
+			continue
 		}
-		logger.Printf("loop: claimed %s", full.ID)
+		logger.Printf("claimed %s", full.ID)
 
 		// Build and launch.
 		prompt := buildRP1Prompt(repoRoot, full, cfg.Review)
@@ -538,119 +593,113 @@ func runLoop(cfg loopConfig, stdin io.Reader, stdout io.Writer, stderr io.Writer
 		}
 		launchArgs, err := buildLaunchArgs(nextCfg, repoRoot, prompt)
 		if err != nil {
-			logger.Printf("loop: error building launch args for %s: %v", full.ID, err)
-			return err
+			logger.Printf("error building launch args for %s: %v", full.ID, err)
+			break
 		}
 
-		logger.Printf("loop: launching %s for %s", cfg.Launcher, full.ID)
+		logger.Printf("launching %s for %s", cfg.Launcher, full.ID)
 		startTime := time.Now()
 		launchErr := cmd.Start(repoRoot, stdin, stdout, stderr, cfg.Launcher, launchArgs...)
 		elapsed := time.Since(startTime).Truncate(time.Second)
 
 		if launchErr != nil {
 			failed++
-			logger.Printf("loop: %s build failed after %s — %v (completed=%d, failed=%d)", full.ID, elapsed, launchErr, completed, failed)
+			logger.Printf("%s build failed after %s — %v (completed=%d, failed=%d)", full.ID, elapsed, launchErr, completed, failed)
 			goto cooldown
 		}
 
 		if cfg.Review {
-			// Review cycle: detect PR → review → fix feedback → re-review → merge.
 			branchName := buildRequirementName(full)
 			prNumber, prErr := detectPR(repoRoot, branchName, cmd)
 			if prErr != nil {
 				failed++
-				logger.Printf("loop: no PR found for %s (branch %s): %v", full.ID, branchName, prErr)
+				logger.Printf("no PR found for %s (branch %s): %v", full.ID, branchName, prErr)
 				goto cooldown
 			}
-			logger.Printf("loop: detected PR #%d for %s", prNumber, full.ID)
+			logger.Printf("detected PR #%d for %s", prNumber, full.ID)
 
 			approved := false
 			for round := 1; round <= cfg.MaxReviewRounds; round++ {
-				logger.Printf("loop: review round %d/%d for PR #%d (%s)", round, cfg.MaxReviewRounds, prNumber, full.ID)
+				logger.Printf("review round %d/%d for PR #%d (%s)", round, cfg.MaxReviewRounds, prNumber, full.ID)
 
-				// Launch review agent.
 				reviewPrompt := fmt.Sprintf("/pr-review %d", prNumber)
 				if err := launchAgent(cfg, repoRoot, reviewPrompt, stdin, stdout, stderr, cmd); err != nil {
-					logger.Printf("loop: review agent failed for PR #%d: %v", prNumber, err)
+					logger.Printf("review agent failed for PR #%d: %v", prNumber, err)
 					break
 				}
 
 				verdict := parseReviewVerdict(repoRoot)
-				logger.Printf("loop: review verdict for PR #%d: %s", prNumber, verdict)
+				logger.Printf("review verdict for PR #%d: %s", prNumber, verdict)
 
 				if verdict == verdictApprove {
 					approved = true
 					break
 				}
 				if verdict == verdictBlock {
-					logger.Printf("loop: PR #%d blocked by review, skipping", prNumber)
+					logger.Printf("PR #%d blocked by review, skipping", prNumber)
 					break
 				}
 
-				// request_changes or unknown — launch fix agent.
 				if round >= cfg.MaxReviewRounds {
-					logger.Printf("loop: exhausted %d review rounds for PR #%d", cfg.MaxReviewRounds, prNumber)
+					logger.Printf("exhausted %d review rounds for PR #%d", cfg.MaxReviewRounds, prNumber)
 					break
 				}
 
-				logger.Printf("loop: launching fix agent for PR #%d (round %d)", prNumber, round)
+				logger.Printf("launching fix agent for PR #%d (round %d)", prNumber, round)
 				fixPrompt := fmt.Sprintf("/address-pr-feedback %d --afk", prNumber)
 				if err := launchAgent(cfg, repoRoot, fixPrompt, stdin, stdout, stderr, cmd); err != nil {
-					logger.Printf("loop: fix agent failed for PR #%d: %v", prNumber, err)
+					logger.Printf("fix agent failed for PR #%d: %v", prNumber, err)
 					break
 				}
 
-				// Push fixes that address-pr-feedback committed locally.
 				if _, pushErr := cmd.Run(repoRoot, "git", "push", "origin", branchName); pushErr != nil {
-					logger.Printf("loop: warning: git push failed for branch %s: %v", branchName, pushErr)
+					logger.Printf("warning: git push failed for branch %s: %v", branchName, pushErr)
 				}
 			}
 
 			if approved {
 				if err := mergePR(repoRoot, prNumber, cmd); err != nil {
 					failed++
-					logger.Printf("loop: failed to merge PR #%d: %v", prNumber, err)
+					logger.Printf("failed to merge PR #%d: %v", prNumber, err)
 				} else {
-					logger.Printf("loop: merged PR #%d", prNumber)
+					logger.Printf("merged PR #%d", prNumber)
 					closeReason := fmt.Sprintf("Completed by autopilot loop — PR #%d merged (launcher=%s, elapsed=%s)", prNumber, cfg.Launcher, time.Since(startTime).Truncate(time.Second))
 					if _, err := cmd.Run(repoRoot, "bd", "close", full.ID, "--reason", closeReason, "--json"); err != nil {
-						logger.Printf("loop: warning: failed to close %s: %v", full.ID, err)
+						logger.Printf("warning: failed to close %s: %v", full.ID, err)
 					} else {
-						logger.Printf("loop: closed %s", full.ID)
+						logger.Printf("closed %s", full.ID)
 					}
 					completed++
-					logger.Printf("loop: %s completed in %s (completed=%d, failed=%d)", full.ID, time.Since(startTime).Truncate(time.Second), completed, failed)
+					logger.Printf("%s completed in %s (completed=%d, failed=%d)", full.ID, time.Since(startTime).Truncate(time.Second), completed, failed)
 				}
 			} else {
 				failed++
-				logger.Printf("loop: %s not approved after review (completed=%d, failed=%d)", full.ID, completed, failed)
+				logger.Printf("%s not approved after review (completed=%d, failed=%d)", full.ID, completed, failed)
 			}
 		} else {
-			// No review — close on agent success.
 			reason := fmt.Sprintf("Completed by autopilot loop (launcher=%s, elapsed=%s)", cfg.Launcher, elapsed)
 			if _, err := cmd.Run(repoRoot, "bd", "close", full.ID, "--reason", reason, "--json"); err != nil {
-				logger.Printf("loop: warning: failed to close %s: %v", full.ID, err)
+				logger.Printf("warning: failed to close %s: %v", full.ID, err)
 			} else {
-				logger.Printf("loop: closed %s", full.ID)
+				logger.Printf("closed %s", full.ID)
 			}
 			completed++
-			logger.Printf("loop: %s completed in %s (completed=%d, failed=%d)", full.ID, elapsed, completed, failed)
+			logger.Printf("%s completed in %s (completed=%d, failed=%d)", full.ID, elapsed, completed, failed)
 		}
 
 	cooldown:
 		if cfg.Cooldown > 0 {
-			logger.Printf("loop: cooling down %s before next task", cfg.Cooldown)
+			logger.Printf("cooling down %s", cfg.Cooldown)
 			select {
-			case sig := <-sigCh:
-				logger.Printf("loop: received %s during cooldown, stopping after %d completed, %d failed", sig, completed, failed)
-				return nil
+			case <-stopCh:
+				logger.Printf("stop received during cooldown (completed=%d, failed=%d)", completed, failed)
+				return completed, failed
 			case <-time.After(cfg.Cooldown):
 			}
 		}
 	}
 
-	logger.Printf("loop: done — %d completed, %d failed", completed, failed)
-	return nil
+	return completed, failed
 }
 
 // launchAgent starts a short-lived agent session with the given prompt.

@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0] - 2026-03-12
+
+### Added
+- `--parallel N` flag on `loop` command — spawns N concurrent workers, each picking and processing issues independently
+- Auto-detect mode (`--parallel 0`, default) — counts ready issues and spawns that many workers, capped at 5
+- Worker log prefixes (`[w1]`, `[w2]`, ...) for distinguishing parallel worker output
+- Graceful claim-race handling — if two workers try to claim the same issue, the loser retries with the next one
+- `stopCh` broadcast for coordinated shutdown across all workers
+
+### Changed
+- Refactored `runLoop` into `runLoop` (orchestrator) + `runWorker` (per-issue loop)
+- Parallel workers discard agent stdout/stderr — autopilot log (`--log-file`) is the single source of truth
+
 ## [0.4.0] - 2026-03-12
 
 ### Added

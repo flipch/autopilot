@@ -102,6 +102,25 @@ With `--review` enabled, the loop becomes:
 
 Requires `gh` CLI authenticated and in PATH.
 
+### Parallel workers
+
+By default (`--parallel 0`), autopilot counts ready issues and spawns that many workers (capped at 5):
+
+```bash
+# Auto-detect: spawns min(ready_issues, 5) workers
+autopilot loop --repo ~/Development/jobber --launcher claude --log-file /tmp/autopilot.log
+
+# Exactly 3 workers
+autopilot loop --repo ~/Development/jobber --launcher claude --parallel 3
+
+# Single worker (sequential, agent gets terminal I/O)
+autopilot loop --repo ~/Development/jobber --launcher claude --parallel 1
+```
+
+Each worker independently picks issues, claims them (atomic via `bd --claim`), and processes them. If two workers race for the same issue, the loser retries with the next one. Worker logs are prefixed `[w1]`, `[w2]`, etc.
+
+With multiple workers, agent stdout/stderr is discarded — use `--log-file` to monitor progress.
+
 ### Logging
 
 By default, loop logs go to stderr (mixed with agent output). Use `--log-file` for clean, dedicated logs:
