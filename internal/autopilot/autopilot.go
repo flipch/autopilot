@@ -137,7 +137,8 @@ func filteredEnv(names ...string) []string {
 		}
 	}
 	// Ensure /pr-review posts a GitHub review so autopilot can read the verdict.
-	env = append(env, "RP1_PR_REVIEW_VERDICT=auto", "RP1_PR_REVIEW_ADD_COMMENTS=true")
+	// CI=true triggers rp1's comment posting mode (P5).
+	env = append(env, "RP1_PR_REVIEW_VERDICT=auto", "RP1_PR_REVIEW_ADD_COMMENTS=true", "CI=true")
 	return env
 }
 

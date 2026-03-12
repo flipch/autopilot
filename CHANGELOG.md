@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.7.7] - 2026-03-12
+
+### Fixed
+- Inject `CI=true` env var for agent subprocesses so rp1's `/pr-review` posts findings as GitHub PR comments (P5 phase requires CI mode)
+
 ## [0.7.6] - 2026-03-12
 
 ### Fixed
