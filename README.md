@@ -14,19 +14,19 @@ Small Go CLI for kicking off the next ready Beads task through OpenCode or Claud
 ## Install
 
 ```bash
-go install github.com/felipeh/autopilot/cmd/autopilot@latest
+GOPRIVATE=github.com/flipch/* go install github.com/flipch/autopilot/cmd/autopilot@latest
 ```
 
-Or install the latest published binary:
+For published binaries from this private repo, use the authenticated installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/flipch/autopilot/main/scripts/install.sh | bash
+gh repo clone flipch/autopilot && ./autopilot/scripts/install.sh
 ```
 
 To pin a version:
 
 ```bash
-AUTOPILOT_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/flipch/autopilot/main/scripts/install.sh | bash
+AUTOPILOT_VERSION=v0.1.1 ./autopilot/scripts/install.sh
 ```
 
 ## Usage

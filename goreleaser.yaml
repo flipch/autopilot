@@ -14,7 +14,7 @@ builds:
     env:
       - CGO_ENABLED=0
     ldflags: |
-      -s -w -X github.com/felipeh/autopilot/internal/autopilot.version={{.Version}} -X github.com/felipeh/autopilot/internal/autopilot.ref={{.ShortCommit}}
+      -s -w -X github.com/flipch/autopilot/internal/autopilot.version={{.Version}} -X github.com/flipch/autopilot/internal/autopilot.ref={{.ShortCommit}}
 
 archives:
   - id: autopilot-binary

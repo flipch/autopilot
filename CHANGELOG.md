@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1] - 2026-03-11
+
+### Fixed
+- corrected the module path to `github.com/flipch/autopilot`
+- switched the installer to authenticated `gh release download` for the private repo
+- updated install documentation for private repository usage
+
 ## [0.1.0] - 2026-03-11
 
 ### Added

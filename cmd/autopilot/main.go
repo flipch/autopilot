@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/felipeh/autopilot/internal/autopilot"
+	"github.com/flipch/autopilot/internal/autopilot"
 )
 
 func main() {
