@@ -67,18 +67,37 @@ main() {
     asset_base="${asset_base}.exe"
   fi
 
-  local asset_name="${asset_base}_${resolved_tag}_${PLATFORM_OS}_${PLATFORM_ARCH}"
+  # gh release tagName usually contains a leading 'v' (eg. v0.1.1) while
+  # goreleaser produces asset names without the leading 'v' (eg. 0.1.1).
+  # Normalize a version without the leading 'v' for matching asset names.
+  local version_no_v
+  version_no_v="${resolved_tag#v}"
+
+  # Use a glob pattern to match possible asset filename variants (some
+  # platforms may include an extra extension). This is more robust than
+  # requiring an exact filename.
+  local asset_pattern
+  asset_pattern="${asset_base}_${version_no_v}_${PLATFORM_OS}_${PLATFORM_ARCH}*"
 
   local tmpdir
   tmpdir=$(mktemp -d)
   trap 'rm -rf "$tmpdir"' EXIT
 
-  gh release download "$resolved_tag" --repo "${REPO_OWNER}/${REPO_NAME}" --pattern "$asset_name" --dir "$tmpdir"
+  gh release download "$resolved_tag" --repo "${REPO_OWNER}/${REPO_NAME}" --pattern "$asset_pattern" --dir "$tmpdir"
 
-  local tmpfile="$tmpdir/$asset_name"
+  # Pick the first matching file in the tmpdir
+  local tmpfile
+  tmpfile=""
+  for f in "$tmpdir"/*; do
+    if [ -f "$f" ]; then
+      tmpfile="$f"
+      break
+    fi
+  done
 
-  if [ ! -f "$tmpfile" ]; then
-    echo "error: release asset '$asset_name' was not downloaded" >&2
+  if [ -z "$tmpfile" ] || [ ! -f "$tmpfile" ]; then
+    echo "error: release asset matching pattern '$asset_pattern' was not downloaded" >&2
+    ls -la "$tmpdir" >&2 || true
     exit 1
   fi
 
