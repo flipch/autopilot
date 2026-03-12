@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.5] - 2026-03-12
+
+### Fixed
+- Zellij workers now stagger starts by 5 seconds each to prevent claim races on bd issues
+- Worker 1 starts immediately, worker 2 after 5s, worker 3 after 10s, etc.
+
 ## [0.7.4] - 2026-03-12
 
 ### Fixed

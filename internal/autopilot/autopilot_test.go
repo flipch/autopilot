@@ -758,14 +758,24 @@ func TestBuildZellijLayout(t *testing.T) {
 	if !strings.Contains(layout, `name="worker-3"`) {
 		t.Fatalf("expected worker-3 pane, got: %s", layout)
 	}
-	if !strings.Contains(layout, `command "autopilot"`) {
-		t.Fatalf("expected autopilot command, got: %s", layout)
+	if !strings.Contains(layout, `command "sh"`) {
+		t.Fatalf("expected sh command wrapper, got: %s", layout)
 	}
-	if !strings.Contains(layout, `"--launcher" "claude"`) {
+	if !strings.Contains(layout, "--launcher claude") {
 		t.Fatalf("expected launcher arg, got: %s", layout)
 	}
 	if !strings.Contains(layout, "tab-bar") || !strings.Contains(layout, "status-bar") {
 		t.Fatalf("expected tab-bar and status-bar, got: %s", layout)
+	}
+	// Worker 1 has no sleep, worker 2 has sleep 5, worker 3 has sleep 10.
+	if strings.Contains(layout, "sleep 0") {
+		t.Fatalf("worker-1 should have no sleep, got: %s", layout)
+	}
+	if !strings.Contains(layout, "sleep 5") {
+		t.Fatalf("expected sleep 5 for worker-2, got: %s", layout)
+	}
+	if !strings.Contains(layout, "sleep 10") {
+		t.Fatalf("expected sleep 10 for worker-3, got: %s", layout)
 	}
 }
 

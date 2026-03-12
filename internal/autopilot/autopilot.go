@@ -826,21 +826,25 @@ func buildWorkerArgs(cfg loopConfig, repoRoot string) []string {
 }
 
 // buildZellijLayout generates a KDL layout with each worker in its own tab.
+// Workers are staggered by 5 seconds each to prevent claim races on bd issues.
 func buildZellijLayout(workerCount int, workerArgs []string) string {
 	var buf bytes.Buffer
 	buf.WriteString("layout {\n")
 
-	// Each worker gets a full-screen tab.
 	for i := 1; i <= workerCount; i++ {
+		delay := (i - 1) * 5
 		buf.WriteString(fmt.Sprintf("    tab name=\"worker-%d\" {\n", i))
 		buf.WriteString("        pane size=1 borderless=true {\n")
 		buf.WriteString("            plugin location=\"tab-bar\"\n")
 		buf.WriteString("        }\n")
 		buf.WriteString(fmt.Sprintf("        pane name=\"worker-%d\" {\n", i))
-		buf.WriteString(fmt.Sprintf("            command %q\n", workerArgs[0]))
-		buf.WriteString("            args")
-		for _, arg := range workerArgs[1:] {
-			buf.WriteString(fmt.Sprintf(" %q", arg))
+		// Wrap with sleep to stagger starts and avoid claim races.
+		buf.WriteString("            command \"sh\"\n")
+		buf.WriteString("            args \"-c\"")
+		if delay > 0 {
+			buf.WriteString(fmt.Sprintf(" \"sleep %d && %s\"", delay, shellJoinArgs(workerArgs)))
+		} else {
+			buf.WriteString(fmt.Sprintf(" \"%s\"", shellJoinArgs(workerArgs)))
 		}
 		buf.WriteString("\n")
 		buf.WriteString("        }\n")
@@ -852,6 +856,19 @@ func buildZellijLayout(workerCount int, workerArgs []string) string {
 
 	buf.WriteString("}\n")
 	return buf.String()
+}
+
+// shellJoinArgs joins args into a shell-safe command string.
+func shellJoinArgs(args []string) string {
+	quoted := make([]string, len(args))
+	for i, arg := range args {
+		if strings.ContainsAny(arg, " \t\n'\"\\$`") {
+			quoted[i] = "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
+		} else {
+			quoted[i] = arg
+		}
+	}
+	return strings.Join(quoted, " ")
 }
 
 // launchAgent starts a short-lived agent session with the given prompt.
